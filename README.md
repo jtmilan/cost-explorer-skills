@@ -201,6 +201,57 @@ Investigation completed at 2024-03-15T14:30:00Z
 - **Missing credentials**: Exit code 1; error message about AWS credentials
 - **AWS API error**: Exit code 1; error message about API failure
 
+## finops-recommend Skill
+
+The finops-recommend skill scans AWS accounts for cost optimization opportunities across 4 rule categories:
+- **idle-ec2**: EC2 instances with <5% avg CPU over 7 days
+- **oversized-rds**: RDS instances using <30% provisioned capacity
+- **orphan-ebs**: Unattached EBS volumes older than 14 days
+- **untagged-spend**: Resources missing required cost-allocation tags
+
+### Usage
+
+```bash
+python skills/finops-recommend/recommend.py [--dry-run] [--rules RULES]
+```
+
+**Arguments:**
+- `--dry-run` (optional): Use fixture data instead of querying AWS
+- `--rules RULES` (optional): Comma-separated rule subset. Valid: idle-ec2,oversized-rds,orphan-ebs,untagged-spend
+
+### Example: Dry-Run Mode
+
+```bash
+python skills/finops-recommend/recommend.py --dry-run
+```
+
+**Expected Output:**
+
+```markdown
+# FinOps Recommendations Report
+
+Generated: 2024-03-15T14:30:00Z
+Rules executed: idle-ec2, oversized-rds, orphan-ebs, untagged-spend
+
+## Findings (sorted by estimated savings)
+
+| ARN | Finding | Est. Monthly Savings | Fix Command |
+|-----|---------|---------------------|-------------|
+| arn:aws:ec2:us-east-1:123456789012:instance/i-0abc123def456 | EC2 instance i-0abc123def456 has 2.3% avg CPU over 7d | $156.00 | `aws ec2 stop-instances --instance-ids i-0abc123def456` |
+| arn:aws:rds:us-east-1:123456789012:db:mydb | RDS instance mydb using 12% of provisioned capacity over 7d | $89.50 | `aws rds modify-db-instance --db-instance-identifier mydb --db-instance-class db.t3.medium` |
+| arn:aws:ec2:us-east-1:123456789012:volume/vol-0xyz789 | EBS volume vol-0xyz789 unattached for 21 days | $45.60 | `aws ec2 delete-volume --volume-id vol-0xyz789` |
+| arn:aws:ec2:us-east-1:123456789012:instance/i-untagged | Resources missing required tags: Environment, CostCenter | $0.00 | `aws ec2 create-tags --resources i-untagged --tags Key=Environment,Value=TBD Key=CostCenter,Value=TBD` |
+
+Total estimated monthly savings: $291.10
+```
+
+### Error Handling
+
+- **Rule failures are isolated**: If one rule fails (e.g., missing permissions), other rules continue executing
+- **Rule errors reported in output**: Failed rules appear in a "Rule Errors" section
+- **Exit code 0**: At least one rule succeeded
+- **Exit code 1**: All rules failed
+
 ## Project Structure
 
 ```
@@ -213,12 +264,16 @@ Investigation completed at 2024-03-15T14:30:00Z
 │   ├── cost-explorer-query/
 │   │   ├── SKILL.md                   # Skill metadata
 │   │   └── query.py                   # Main CLI implementation
-│   └── cost-anomaly-investigate/
+│   ├── cost-anomaly-investigate/
+│   │   ├── SKILL.md                   # Skill metadata
+│   │   └── investigate.py             # Main CLI implementation
+│   └── finops-recommend/
 │       ├── SKILL.md                   # Skill metadata
-│       └── investigate.py             # Main CLI implementation
+│       └── recommend.py               # Main CLI implementation
 └── tests/
     ├── test_query.py                  # Pytest test suite for query
-    └── test_investigate.py            # Pytest test suite for investigate
+    ├── test_investigate.py            # Pytest test suite for investigate
+    └── test_recommend.py              # Pytest test suite for recommend
 ```
 
 ## License
