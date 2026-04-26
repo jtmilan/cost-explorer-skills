@@ -7,12 +7,15 @@ Tests cover:
 - FixtureProvider.get_fixture_results() returns 4 results (one per rule)
 - FixtureProvider.get_fixture_results_for_rules() filters correctly
 - Schema validation (ARN prefix, float savings, 'aws ' command prefix)
+- IdleEc2Rule with botocore.stub.Stubber for AWS API mocking
 """
 
 import pytest
 import sys
 import os
 import importlib.util
+from datetime import datetime, timezone, timedelta
+from unittest.mock import patch
 
 
 # Load the recommend module directly from file (handles hyphenated path)
@@ -32,6 +35,11 @@ spec.loader.exec_module(recommend_module)
 Finding = recommend_module.Finding
 RuleResult = recommend_module.RuleResult
 FixtureProvider = recommend_module.FixtureProvider
+BaseRule = recommend_module.BaseRule
+IdleEc2Rule = recommend_module.IdleEc2Rule
+CPU_THRESHOLD = recommend_module.CPU_THRESHOLD
+LOOKBACK_DAYS = recommend_module.LOOKBACK_DAYS
+INSTANCE_PRICING = recommend_module.INSTANCE_PRICING
 
 
 # ============================================================================
@@ -468,3 +476,439 @@ class TestNoAWSCalls:
         # Verify we can get filtered results (no AWS dependencies)
         results = FixtureProvider.get_fixture_results_for_rules(["idle-ec2"])
         assert len(results) == 1, "Should return filtered results without any AWS calls"
+
+
+# ============================================================================
+# Tests for BaseRule ABC
+# ============================================================================
+
+class TestBaseRule:
+    """Test BaseRule abstract base class."""
+
+    def test_base_rule_is_abstract(self):
+        """Test that BaseRule cannot be instantiated directly."""
+        from abc import ABC
+        assert issubclass(BaseRule, ABC), "BaseRule should be an ABC"
+
+    def test_base_rule_has_rule_id_property(self):
+        """Test that BaseRule defines abstract rule_id property."""
+        import inspect
+        assert hasattr(BaseRule, 'rule_id'), "BaseRule should have rule_id property"
+
+    def test_base_rule_has_execute_method(self):
+        """Test that BaseRule defines abstract execute method."""
+        import inspect
+        assert hasattr(BaseRule, 'execute'), "BaseRule should have execute method"
+
+
+# ============================================================================
+# Tests for IdleEc2Rule
+# ============================================================================
+
+class TestIdleEc2Rule:
+    """Tests for IdleEc2Rule using botocore.stub.Stubber."""
+
+    def test_idle_ec2_rule_extends_base_rule(self):
+        """Test IdleEc2Rule extends BaseRule."""
+        assert issubclass(IdleEc2Rule, BaseRule), "IdleEc2Rule should extend BaseRule"
+
+    def test_idle_ec2_rule_id(self):
+        """Test IdleEc2Rule has correct rule_id."""
+        rule = IdleEc2Rule()
+        assert rule.rule_id == "idle-ec2", "IdleEc2Rule.rule_id should be 'idle-ec2'"
+
+    def test_idle_ec2_detects_low_cpu_instance(self):
+        """Test rule detects instance with <5% CPU (2.3% avg)."""
+        import boto3
+        from botocore.stub import Stubber
+
+        rule = IdleEc2Rule()
+
+        # Setup EC2 client and stubber
+        ec2_client = boto3.client('ec2', region_name='us-east-1')
+        ec2_stubber = Stubber(ec2_client)
+
+        # Mock DescribeInstances response with running instance
+        # OwnerId is at the Reservation level, not Instance level
+        ec2_stubber.add_response(
+            'describe_instances',
+            {
+                'Reservations': [{
+                    'OwnerId': '123456789012',
+                    'Instances': [{
+                        'InstanceId': 'i-12345678',
+                        'InstanceType': 'm5.large',
+                        'State': {'Name': 'running'}
+                    }]
+                }]
+            },
+            expected_params={
+                'Filters': [{'Name': 'instance-state-name', 'Values': ['running']}]
+            }
+        )
+
+        # Setup CloudWatch client and stubber
+        cw_client = boto3.client('cloudwatch', region_name='us-east-1')
+        cw_stubber = Stubber(cw_client)
+
+        # Mock GetMetricStatistics response with low CPU (2.3%)
+        cw_stubber.add_response(
+            'get_metric_statistics',
+            {
+                'Datapoints': [
+                    {'Average': 2.3, 'Timestamp': datetime.now(timezone.utc)}
+                ]
+            }
+        )
+
+        ec2_stubber.activate()
+        cw_stubber.activate()
+
+        # Inject stubbed clients
+        rule._ec2_client = ec2_client
+        rule._cw_client = cw_client
+
+        result = rule.execute()
+
+        ec2_stubber.deactivate()
+        cw_stubber.deactivate()
+
+        assert result.rule_id == "idle-ec2"
+        assert result.error is None
+        assert len(result.findings) == 1
+        assert result.findings[0].arn.startswith("arn:aws:ec2:")
+        assert "i-12345678" in result.findings[0].arn
+        assert "2.3%" in result.findings[0].finding
+        assert result.findings[0].est_monthly_saved_usd > 0
+        assert result.findings[0].fix_command == "aws ec2 stop-instances --instance-ids i-12345678"
+
+    def test_idle_ec2_no_findings_when_cpu_above_threshold(self):
+        """Test rule returns no findings when CPU > 5%."""
+        import boto3
+        from botocore.stub import Stubber
+
+        rule = IdleEc2Rule()
+
+        # Setup EC2 client and stubber
+        ec2_client = boto3.client('ec2', region_name='us-east-1')
+        ec2_stubber = Stubber(ec2_client)
+
+        # Mock DescribeInstances response with running instance
+        # OwnerId is at the Reservation level, not Instance level
+        ec2_stubber.add_response(
+            'describe_instances',
+            {
+                'Reservations': [{
+                    'OwnerId': '123456789012',
+                    'Instances': [{
+                        'InstanceId': 'i-12345678',
+                        'InstanceType': 'm5.large',
+                        'State': {'Name': 'running'}
+                    }]
+                }]
+            },
+            expected_params={
+                'Filters': [{'Name': 'instance-state-name', 'Values': ['running']}]
+            }
+        )
+
+        # Setup CloudWatch client and stubber
+        cw_client = boto3.client('cloudwatch', region_name='us-east-1')
+        cw_stubber = Stubber(cw_client)
+
+        # Mock GetMetricStatistics response with 10% CPU (above threshold)
+        cw_stubber.add_response(
+            'get_metric_statistics',
+            {
+                'Datapoints': [
+                    {'Average': 10.0, 'Timestamp': datetime.now(timezone.utc)}
+                ]
+            }
+        )
+
+        ec2_stubber.activate()
+        cw_stubber.activate()
+
+        # Inject stubbed clients
+        rule._ec2_client = ec2_client
+        rule._cw_client = cw_client
+
+        result = rule.execute()
+
+        ec2_stubber.deactivate()
+        cw_stubber.deactivate()
+
+        assert result.rule_id == "idle-ec2"
+        assert result.error is None
+        assert len(result.findings) == 0, "No findings should be returned when CPU is above threshold"
+
+    def test_idle_ec2_handles_no_credentials_error_gracefully(self):
+        """Test rule handles NoCredentialsError gracefully."""
+        import botocore.exceptions
+
+        rule = IdleEc2Rule()
+
+        # Create a mock that raises NoCredentialsError
+        class MockEC2Client:
+            def get_paginator(self, operation_name):
+                raise botocore.exceptions.NoCredentialsError()
+
+            @property
+            def meta(self):
+                class Meta:
+                    region_name = 'us-east-1'
+                return Meta()
+
+        rule._ec2_client = MockEC2Client()
+
+        result = rule.execute()
+
+        assert result.rule_id == "idle-ec2"
+        assert result.error is not None
+        assert "credentials" in result.error.lower()
+        assert len(result.findings) == 0
+
+    def test_idle_ec2_handles_client_error_gracefully(self):
+        """Test rule handles ClientError gracefully."""
+        import botocore.exceptions
+
+        rule = IdleEc2Rule()
+
+        # Create a mock that raises ClientError
+        class MockEC2Client:
+            def get_paginator(self, operation_name):
+                error_response = {
+                    'Error': {
+                        'Code': 'AccessDenied',
+                        'Message': 'User not authorized'
+                    }
+                }
+                raise botocore.exceptions.ClientError(error_response, 'DescribeInstances')
+
+            @property
+            def meta(self):
+                class Meta:
+                    region_name = 'us-east-1'
+                return Meta()
+
+        rule._ec2_client = MockEC2Client()
+
+        result = rule.execute()
+
+        assert result.rule_id == "idle-ec2"
+        assert result.error is not None
+        assert "AccessDenied" in result.error
+        assert len(result.findings) == 0
+
+    def test_idle_ec2_correct_arn_format(self):
+        """Test rule generates correct ARN format."""
+        import boto3
+        from botocore.stub import Stubber
+
+        rule = IdleEc2Rule()
+
+        # Setup EC2 client and stubber
+        ec2_client = boto3.client('ec2', region_name='us-east-1')
+        ec2_stubber = Stubber(ec2_client)
+
+        # Mock DescribeInstances response
+        # OwnerId is at the Reservation level, not Instance level
+        ec2_stubber.add_response(
+            'describe_instances',
+            {
+                'Reservations': [{
+                    'OwnerId': '999888777666',
+                    'Instances': [{
+                        'InstanceId': 'i-abc123xyz',
+                        'InstanceType': 't3.medium',
+                        'State': {'Name': 'running'}
+                    }]
+                }]
+            },
+            expected_params={
+                'Filters': [{'Name': 'instance-state-name', 'Values': ['running']}]
+            }
+        )
+
+        # Setup CloudWatch client and stubber
+        cw_client = boto3.client('cloudwatch', region_name='us-east-1')
+        cw_stubber = Stubber(cw_client)
+
+        # Mock GetMetricStatistics response with low CPU
+        cw_stubber.add_response(
+            'get_metric_statistics',
+            {
+                'Datapoints': [
+                    {'Average': 1.5, 'Timestamp': datetime.now(timezone.utc)}
+                ]
+            }
+        )
+
+        ec2_stubber.activate()
+        cw_stubber.activate()
+
+        rule._ec2_client = ec2_client
+        rule._cw_client = cw_client
+
+        result = rule.execute()
+
+        ec2_stubber.deactivate()
+        cw_stubber.deactivate()
+
+        assert len(result.findings) == 1
+        arn = result.findings[0].arn
+        # ARN format: arn:aws:ec2:{region}:{account_id}:instance/{instance_id}
+        assert arn.startswith("arn:aws:ec2:")
+        assert "us-east-1" in arn
+        assert "999888777666" in arn
+        assert "i-abc123xyz" in arn
+        assert ":instance/" in arn
+
+    def test_idle_ec2_correct_savings_calculation(self):
+        """Test rule calculates savings correctly (hourly_rate * 730)."""
+        import boto3
+        from botocore.stub import Stubber
+
+        rule = IdleEc2Rule()
+
+        # Setup EC2 client and stubber
+        ec2_client = boto3.client('ec2', region_name='us-east-1')
+        ec2_stubber = Stubber(ec2_client)
+
+        # Mock DescribeInstances response with m5.large instance
+        # OwnerId is at the Reservation level, not Instance level
+        ec2_stubber.add_response(
+            'describe_instances',
+            {
+                'Reservations': [{
+                    'OwnerId': '123456789012',
+                    'Instances': [{
+                        'InstanceId': 'i-savings-test',
+                        'InstanceType': 'm5.large',  # $0.096/hr
+                        'State': {'Name': 'running'}
+                    }]
+                }]
+            },
+            expected_params={
+                'Filters': [{'Name': 'instance-state-name', 'Values': ['running']}]
+            }
+        )
+
+        # Setup CloudWatch client and stubber
+        cw_client = boto3.client('cloudwatch', region_name='us-east-1')
+        cw_stubber = Stubber(cw_client)
+
+        # Mock GetMetricStatistics response with low CPU
+        cw_stubber.add_response(
+            'get_metric_statistics',
+            {
+                'Datapoints': [
+                    {'Average': 2.0, 'Timestamp': datetime.now(timezone.utc)}
+                ]
+            }
+        )
+
+        ec2_stubber.activate()
+        cw_stubber.activate()
+
+        rule._ec2_client = ec2_client
+        rule._cw_client = cw_client
+
+        result = rule.execute()
+
+        ec2_stubber.deactivate()
+        cw_stubber.deactivate()
+
+        assert len(result.findings) == 1
+        # m5.large hourly rate is $0.096
+        # Monthly savings = 0.096 * 730 = $70.08
+        expected_savings = INSTANCE_PRICING['m5.large'] * 730
+        assert result.findings[0].est_monthly_saved_usd == expected_savings
+
+
+class TestIdleEc2RuleConstants:
+    """Test IdleEc2Rule constants."""
+
+    def test_cpu_threshold_is_5_percent(self):
+        """Test CPU_THRESHOLD is set to 5.0."""
+        assert CPU_THRESHOLD == 5.0, "CPU_THRESHOLD should be 5.0 percent"
+
+    def test_lookback_days_is_7(self):
+        """Test LOOKBACK_DAYS is set to 7."""
+        assert LOOKBACK_DAYS == 7, "LOOKBACK_DAYS should be 7 days"
+
+    def test_instance_pricing_contains_required_types(self):
+        """Test INSTANCE_PRICING contains required instance types."""
+        required_types = ['t2.micro', 't3.medium', 'm5.large']
+        for instance_type in required_types:
+            assert instance_type in INSTANCE_PRICING, (
+                f"INSTANCE_PRICING should contain {instance_type}"
+            )
+
+    def test_instance_pricing_values_are_floats(self):
+        """Test all INSTANCE_PRICING values are floats."""
+        for instance_type, price in INSTANCE_PRICING.items():
+            assert isinstance(price, float), (
+                f"Price for {instance_type} should be a float"
+            )
+
+    def test_fix_command_format(self):
+        """Test fix_command follows correct format."""
+        import boto3
+        from botocore.stub import Stubber
+
+        rule = IdleEc2Rule()
+
+        # Setup EC2 client and stubber
+        ec2_client = boto3.client('ec2', region_name='us-east-1')
+        ec2_stubber = Stubber(ec2_client)
+
+        # Mock DescribeInstances response
+        # OwnerId is at the Reservation level, not Instance level
+        ec2_stubber.add_response(
+            'describe_instances',
+            {
+                'Reservations': [{
+                    'OwnerId': '123456789012',
+                    'Instances': [{
+                        'InstanceId': 'i-testinstance',
+                        'InstanceType': 't2.micro',
+                        'State': {'Name': 'running'}
+                    }]
+                }]
+            },
+            expected_params={
+                'Filters': [{'Name': 'instance-state-name', 'Values': ['running']}]
+            }
+        )
+
+        # Setup CloudWatch client and stubber
+        cw_client = boto3.client('cloudwatch', region_name='us-east-1')
+        cw_stubber = Stubber(cw_client)
+
+        # Mock GetMetricStatistics response with low CPU
+        cw_stubber.add_response(
+            'get_metric_statistics',
+            {
+                'Datapoints': [
+                    {'Average': 1.0, 'Timestamp': datetime.now(timezone.utc)}
+                ]
+            }
+        )
+
+        ec2_stubber.activate()
+        cw_stubber.activate()
+
+        rule._ec2_client = ec2_client
+        rule._cw_client = cw_client
+
+        result = rule.execute()
+
+        ec2_stubber.deactivate()
+        cw_stubber.deactivate()
+
+        assert len(result.findings) == 1
+        fix_cmd = result.findings[0].fix_command
+        # Verify format: aws ec2 stop-instances --instance-ids {id}
+        assert fix_cmd == "aws ec2 stop-instances --instance-ids i-testinstance"
+        assert fix_cmd.startswith("aws ec2 stop-instances --instance-ids ")
