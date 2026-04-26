@@ -10,6 +10,7 @@ This module provides:
 - RuleResult: Dataclass representing results from a single rule execution
 - BaseRule: Abstract base class for cost optimization rules
 - IdleEc2Rule: Rule detecting EC2 instances with <5% avg CPU over 7 days
+- OversizedRdsRule: Rule to detect underutilized RDS instances
 - FixtureProvider: Static class providing deterministic fixture data for --dry-run mode
 """
 
@@ -284,6 +285,215 @@ class IdleEc2Rule(BaseRule):
         total = sum(dp['Average'] for dp in datapoints)
         return total / len(datapoints)
 
+
+# ============================================================================
+# OversizedRdsRule Implementation
+# ============================================================================
+
+class OversizedRdsRule(BaseRule):
+    """Detects RDS instances using <30% provisioned capacity over 7 days.
+
+    AWS APIs:
+        - RDS.DescribeDBInstances: No filters (all instances)
+        - CloudWatch.GetMetricStatistics:
+            Namespace=AWS/RDS
+            MetricName=CPUUtilization
+            Period=3600
+            Statistics=[Average]
+            StartTime=NOW-7d
+            EndTime=NOW
+
+    Detection Logic:
+        1. Get all RDS instances
+        2. For each instance, fetch 7-day CPU average
+        3. If avg(CPUUtilization) < 30%, flag as oversized
+
+    Savings Estimation:
+        Estimate 30% savings by downsizing instance class.
+        Current monthly cost × 0.30 = estimated savings.
+
+    Fix Command:
+        aws rds modify-db-instance --db-instance-identifier {id} --db-instance-class {smaller_class}
+    """
+
+    CPU_THRESHOLD: float = 30.0  # Percent
+    LOOKBACK_DAYS: int = 7
+    SAVINGS_RATIO: float = 0.30  # Assume 30% savings from rightsizing
+
+    # Simplified RDS pricing (USD per hour, us-east-1, single-AZ)
+    RDS_PRICING: Dict[str, float] = {
+        "db.t3.micro": 0.017,
+        "db.t3.small": 0.034,
+        "db.t3.medium": 0.068,
+        "db.m5.large": 0.171,
+        "db.m5.xlarge": 0.342,
+        "db.r5.large": 0.24,
+    }
+    DEFAULT_HOURLY_RATE: float = 0.20
+
+    # Downsizing recommendations
+    DOWNSIZE_MAP: Dict[str, str] = {
+        "db.m5.xlarge": "db.m5.large",
+        "db.m5.large": "db.t3.medium",
+        "db.r5.xlarge": "db.r5.large",
+        "db.r5.large": "db.m5.large",
+        "db.t3.medium": "db.t3.small",
+        "db.t3.small": "db.t3.micro",
+    }
+
+    def __init__(self) -> None:
+        """Initialize the OversizedRdsRule with AWS clients set to None."""
+        self._rds_client = None
+        self._cw_client = None
+
+    @property
+    def rule_id(self) -> str:
+        return "oversized-rds"
+
+    def _get_rds_client(self):
+        """Get or create RDS client."""
+        if self._rds_client is None:
+            import boto3
+            self._rds_client = boto3.client('rds', region_name='us-east-1')
+        return self._rds_client
+
+    def _get_cw_client(self):
+        """Get or create CloudWatch client."""
+        if self._cw_client is None:
+            import boto3
+            self._cw_client = boto3.client('cloudwatch', region_name='us-east-1')
+        return self._cw_client
+
+    def _get_avg_cpu(self, db_instance_identifier: str) -> Optional[float]:
+        """Get average CPU utilization for an RDS instance over the lookback period.
+
+        Args:
+            db_instance_identifier: The RDS instance identifier
+
+        Returns:
+            Average CPU utilization as a float, or None if no data available
+        """
+        cw_client = self._get_cw_client()
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(days=self.LOOKBACK_DAYS)
+
+        response = cw_client.get_metric_statistics(
+            Namespace='AWS/RDS',
+            MetricName='CPUUtilization',
+            Dimensions=[
+                {'Name': 'DBInstanceIdentifier', 'Value': db_instance_identifier}
+            ],
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=3600,  # 1 hour
+            Statistics=['Average']
+        )
+
+        datapoints = response.get('Datapoints', [])
+        if not datapoints:
+            return None
+
+        # Calculate the average of all datapoints
+        total = sum(dp['Average'] for dp in datapoints)
+        return total / len(datapoints)
+
+    def _calculate_monthly_cost(self, instance_class: str) -> float:
+        """Calculate estimated monthly cost for an RDS instance class.
+
+        Args:
+            instance_class: The RDS instance class (e.g., 'db.m5.large')
+
+        Returns:
+            Estimated monthly cost in USD
+        """
+        hourly_rate = self.RDS_PRICING.get(instance_class, self.DEFAULT_HOURLY_RATE)
+        # 730 hours per month (average)
+        return hourly_rate * 730
+
+    def _get_smaller_instance_class(self, current_class: str) -> str:
+        """Get the recommended smaller instance class.
+
+        Args:
+            current_class: The current RDS instance class
+
+        Returns:
+            The recommended smaller instance class, or current class if no downsize mapping exists
+        """
+        return self.DOWNSIZE_MAP.get(current_class, current_class)
+
+    def execute(self) -> RuleResult:
+        """Execute oversized RDS detection.
+
+        Returns:
+            RuleResult with findings for instances averaging <30% CPU,
+            or error message if AWS calls fail.
+        """
+        try:
+            import botocore.exceptions
+
+            rds_client = self._get_rds_client()
+
+            # Get all RDS instances
+            response = rds_client.describe_db_instances()
+            db_instances = response.get('DBInstances', [])
+
+            findings: List[Finding] = []
+
+            for db_instance in db_instances:
+                db_instance_identifier = db_instance['DBInstanceIdentifier']
+                instance_class = db_instance['DBInstanceClass']
+                db_instance_arn = db_instance['DBInstanceArn']
+
+                # Get CPU utilization
+                avg_cpu = self._get_avg_cpu(db_instance_identifier)
+
+                # Skip instances without sufficient data
+                if avg_cpu is None:
+                    continue
+
+                # Check if underutilized
+                if avg_cpu < self.CPU_THRESHOLD:
+                    # Calculate savings
+                    current_monthly_cost = self._calculate_monthly_cost(instance_class)
+                    estimated_savings = current_monthly_cost * self.SAVINGS_RATIO
+
+                    # Get smaller instance class
+                    smaller_class = self._get_smaller_instance_class(instance_class)
+
+                    findings.append(Finding(
+                        arn=db_instance_arn,
+                        finding=f"RDS instance {db_instance_identifier} using {avg_cpu:.1f}% of provisioned capacity over 7d",
+                        est_monthly_saved_usd=round(estimated_savings, 2),
+                        fix_command=f"aws rds modify-db-instance --db-instance-identifier {db_instance_identifier} --db-instance-class {smaller_class}"
+                    ))
+
+            return RuleResult(rule_id=self.rule_id, findings=findings, error=None)
+
+        except Exception as e:
+            # Import botocore exceptions for specific handling
+            try:
+                import botocore.exceptions
+                if isinstance(e, botocore.exceptions.NoCredentialsError):
+                    return RuleResult(
+                        rule_id=self.rule_id,
+                        findings=[],
+                        error=f"AWS credentials not found: {e}"
+                    )
+                elif isinstance(e, botocore.exceptions.ClientError):
+                    error_code = e.response.get("Error", {}).get("Code", "Unknown")
+                    return RuleResult(
+                        rule_id=self.rule_id,
+                        findings=[],
+                        error=f"{error_code}: {e}"
+                    )
+            except ImportError:
+                pass
+
+            return RuleResult(
+                rule_id=self.rule_id,
+                findings=[],
+                error=f"Unexpected error: {e}"
+            )
 
 class FixtureProvider:
     """Provides deterministic fixture data for --dry-run mode.

@@ -41,6 +41,7 @@ IdleEc2Rule = recommend_module.IdleEc2Rule
 CPU_THRESHOLD = recommend_module.CPU_THRESHOLD
 LOOKBACK_DAYS = recommend_module.LOOKBACK_DAYS
 INSTANCE_PRICING = recommend_module.INSTANCE_PRICING
+OversizedRdsRule = recommend_module.OversizedRdsRule
 
 
 # ============================================================================
@@ -1265,3 +1266,397 @@ class TestIdleEc2RuleConstants:
         # Verify format: aws ec2 stop-instances --instance-ids {id}
         assert fix_cmd == "aws ec2 stop-instances --instance-ids i-testinstance"
         assert fix_cmd.startswith("aws ec2 stop-instances --instance-ids ")
+
+# ============================================================================
+# Tests for OversizedRdsRule
+# ============================================================================
+
+class TestOversizedRdsRule:
+    """Tests for OversizedRdsRule using botocore.stub.Stubber."""
+
+    def test_oversized_rds_rule_id(self):
+        """Test OversizedRdsRule has correct rule_id."""
+        rule = OversizedRdsRule()
+        assert rule.rule_id == "oversized-rds"
+
+    def test_oversized_rds_cpu_threshold(self):
+        """Test CPU_THRESHOLD constant is 30.0."""
+        assert OversizedRdsRule.CPU_THRESHOLD == 30.0
+
+    def test_oversized_rds_savings_ratio(self):
+        """Test SAVINGS_RATIO constant is 0.30."""
+        assert OversizedRdsRule.SAVINGS_RATIO == 0.30
+
+    def test_oversized_rds_pricing_dict(self):
+        """Test RDS_PRICING dict exists with expected instance types."""
+        pricing = OversizedRdsRule.RDS_PRICING
+        assert "db.t3.micro" in pricing
+        assert "db.m5.large" in pricing
+        assert isinstance(pricing["db.t3.micro"], float)
+        assert isinstance(pricing["db.m5.large"], float)
+
+    def test_oversized_rds_downsize_map(self):
+        """Test DOWNSIZE_MAP dict exists with expected mappings."""
+        downsize_map = OversizedRdsRule.DOWNSIZE_MAP
+        assert "db.m5.xlarge" in downsize_map
+        assert downsize_map["db.m5.xlarge"] == "db.m5.large"
+        assert "db.m5.large" in downsize_map
+        assert downsize_map["db.m5.large"] == "db.t3.medium"
+
+    def test_oversized_rds_detects_low_cpu_instance(self):
+        """Test rule detects RDS instance with <30% CPU (12% avg)."""
+        rule = OversizedRdsRule()
+
+        # Setup RDS stubber
+        rds_client = boto3.client('rds', region_name='us-east-1')
+        rds_stubber = Stubber(rds_client)
+
+        # Mock DescribeDBInstances response
+        rds_stubber.add_response(
+            'describe_db_instances',
+            {
+                'DBInstances': [{
+                    'DBInstanceIdentifier': 'test-db',
+                    'DBInstanceClass': 'db.m5.large',
+                    'DBInstanceArn': 'arn:aws:rds:us-east-1:123456789012:db:test-db',
+                    'DBInstanceStatus': 'available'
+                }]
+            }
+        )
+
+        # Setup CloudWatch stubber
+        cw_client = boto3.client('cloudwatch', region_name='us-east-1')
+        cw_stubber = Stubber(cw_client)
+
+        # Mock GetMetricStatistics response with low CPU (12%)
+        cw_stubber.add_response(
+            'get_metric_statistics',
+            {
+                'Datapoints': [
+                    {'Average': 12.0, 'Timestamp': datetime.now(timezone.utc)}
+                ]
+            }
+        )
+
+        rds_stubber.activate()
+        cw_stubber.activate()
+
+        # Inject stubbed clients
+        rule._rds_client = rds_client
+        rule._cw_client = cw_client
+
+        result = rule.execute()
+
+        rds_stubber.deactivate()
+        cw_stubber.deactivate()
+
+        assert result.rule_id == "oversized-rds"
+        assert result.error is None
+        assert len(result.findings) == 1
+        assert result.findings[0].arn.startswith("arn:aws:rds:")
+        assert "test-db" in result.findings[0].arn
+        assert result.findings[0].est_monthly_saved_usd > 0
+        assert "12.0%" in result.findings[0].finding
+
+    def test_oversized_rds_no_findings_high_cpu(self):
+        """Test rule returns no findings for instance with >30% CPU (40% avg)."""
+        rule = OversizedRdsRule()
+
+        # Setup RDS stubber
+        rds_client = boto3.client('rds', region_name='us-east-1')
+        rds_stubber = Stubber(rds_client)
+
+        # Mock DescribeDBInstances response
+        rds_stubber.add_response(
+            'describe_db_instances',
+            {
+                'DBInstances': [{
+                    'DBInstanceIdentifier': 'active-db',
+                    'DBInstanceClass': 'db.m5.large',
+                    'DBInstanceArn': 'arn:aws:rds:us-east-1:123456789012:db:active-db',
+                    'DBInstanceStatus': 'available'
+                }]
+            }
+        )
+
+        # Setup CloudWatch stubber
+        cw_client = boto3.client('cloudwatch', region_name='us-east-1')
+        cw_stubber = Stubber(cw_client)
+
+        # Mock GetMetricStatistics response with high CPU (40%)
+        cw_stubber.add_response(
+            'get_metric_statistics',
+            {
+                'Datapoints': [
+                    {'Average': 40.0, 'Timestamp': datetime.now(timezone.utc)}
+                ]
+            }
+        )
+
+        rds_stubber.activate()
+        cw_stubber.activate()
+
+        # Inject stubbed clients
+        rule._rds_client = rds_client
+        rule._cw_client = cw_client
+
+        result = rule.execute()
+
+        rds_stubber.deactivate()
+        cw_stubber.deactivate()
+
+        assert result.rule_id == "oversized-rds"
+        assert result.error is None
+        assert len(result.findings) == 0
+
+    def test_oversized_rds_handles_errors_gracefully(self):
+        """Test rule handles errors gracefully and returns RuleResult with error."""
+        rule = OversizedRdsRule()
+
+        # Setup RDS stubber with error
+        rds_client = boto3.client('rds', region_name='us-east-1')
+        rds_stubber = Stubber(rds_client)
+
+        # Add error response
+        rds_stubber.add_client_error(
+            'describe_db_instances',
+            service_error_code='AccessDeniedException',
+            service_message='User: arn:aws:iam::123456789012:user/test is not authorized'
+        )
+
+        rds_stubber.activate()
+
+        # Inject stubbed client
+        rule._rds_client = rds_client
+
+        result = rule.execute()
+
+        rds_stubber.deactivate()
+
+        assert result.rule_id == "oversized-rds"
+        assert result.error is not None
+        assert "AccessDeniedException" in result.error
+        assert len(result.findings) == 0
+
+    def test_oversized_rds_correct_arn_format(self):
+        """Test that findings have correct ARN format arn:aws:rds:..."""
+        rule = OversizedRdsRule()
+
+        # Setup RDS stubber
+        rds_client = boto3.client('rds', region_name='us-east-1')
+        rds_stubber = Stubber(rds_client)
+
+        # Mock DescribeDBInstances response with proper ARN
+        rds_stubber.add_response(
+            'describe_db_instances',
+            {
+                'DBInstances': [{
+                    'DBInstanceIdentifier': 'mydb',
+                    'DBInstanceClass': 'db.m5.large',
+                    'DBInstanceArn': 'arn:aws:rds:us-east-1:123456789012:db:mydb',
+                    'DBInstanceStatus': 'available'
+                }]
+            }
+        )
+
+        # Setup CloudWatch stubber
+        cw_client = boto3.client('cloudwatch', region_name='us-east-1')
+        cw_stubber = Stubber(cw_client)
+
+        # Mock GetMetricStatistics response with low CPU
+        cw_stubber.add_response(
+            'get_metric_statistics',
+            {
+                'Datapoints': [
+                    {'Average': 15.0, 'Timestamp': datetime.now(timezone.utc)}
+                ]
+            }
+        )
+
+        rds_stubber.activate()
+        cw_stubber.activate()
+
+        # Inject stubbed clients
+        rule._rds_client = rds_client
+        rule._cw_client = cw_client
+
+        result = rule.execute()
+
+        rds_stubber.deactivate()
+        cw_stubber.deactivate()
+
+        assert len(result.findings) == 1
+        finding = result.findings[0]
+        # Verify ARN format
+        assert finding.arn.startswith("arn:aws:rds:")
+        assert ":db:" in finding.arn
+        assert "mydb" in finding.arn
+
+    def test_oversized_rds_fix_command_includes_smaller_class(self):
+        """Test fix_command includes downsized instance class from DOWNSIZE_MAP."""
+        rule = OversizedRdsRule()
+
+        # Setup RDS stubber
+        rds_client = boto3.client('rds', region_name='us-east-1')
+        rds_stubber = Stubber(rds_client)
+
+        # Mock DescribeDBInstances response with db.m5.large (maps to db.t3.medium)
+        rds_stubber.add_response(
+            'describe_db_instances',
+            {
+                'DBInstances': [{
+                    'DBInstanceIdentifier': 'test-db-large',
+                    'DBInstanceClass': 'db.m5.large',
+                    'DBInstanceArn': 'arn:aws:rds:us-east-1:123456789012:db:test-db-large',
+                    'DBInstanceStatus': 'available'
+                }]
+            }
+        )
+
+        # Setup CloudWatch stubber
+        cw_client = boto3.client('cloudwatch', region_name='us-east-1')
+        cw_stubber = Stubber(cw_client)
+
+        # Mock GetMetricStatistics response with low CPU
+        cw_stubber.add_response(
+            'get_metric_statistics',
+            {
+                'Datapoints': [
+                    {'Average': 10.0, 'Timestamp': datetime.now(timezone.utc)}
+                ]
+            }
+        )
+
+        rds_stubber.activate()
+        cw_stubber.activate()
+
+        # Inject stubbed clients
+        rule._rds_client = rds_client
+        rule._cw_client = cw_client
+
+        result = rule.execute()
+
+        rds_stubber.deactivate()
+        cw_stubber.deactivate()
+
+        assert len(result.findings) == 1
+        finding = result.findings[0]
+
+        # Verify fix_command format and smaller class
+        assert finding.fix_command.startswith("aws rds modify-db-instance")
+        assert "--db-instance-identifier test-db-large" in finding.fix_command
+        # db.m5.large should map to db.t3.medium per DOWNSIZE_MAP
+        assert "--db-instance-class db.t3.medium" in finding.fix_command
+
+    def test_oversized_rds_savings_calculation(self):
+        """Test monthly savings calculated as current_monthly_cost * SAVINGS_RATIO."""
+        rule = OversizedRdsRule()
+
+        # Setup RDS stubber
+        rds_client = boto3.client('rds', region_name='us-east-1')
+        rds_stubber = Stubber(rds_client)
+
+        # Mock DescribeDBInstances response
+        rds_stubber.add_response(
+            'describe_db_instances',
+            {
+                'DBInstances': [{
+                    'DBInstanceIdentifier': 'pricing-test-db',
+                    'DBInstanceClass': 'db.m5.large',
+                    'DBInstanceArn': 'arn:aws:rds:us-east-1:123456789012:db:pricing-test-db',
+                    'DBInstanceStatus': 'available'
+                }]
+            }
+        )
+
+        # Setup CloudWatch stubber
+        cw_client = boto3.client('cloudwatch', region_name='us-east-1')
+        cw_stubber = Stubber(cw_client)
+
+        # Mock GetMetricStatistics response with low CPU
+        cw_stubber.add_response(
+            'get_metric_statistics',
+            {
+                'Datapoints': [
+                    {'Average': 5.0, 'Timestamp': datetime.now(timezone.utc)}
+                ]
+            }
+        )
+
+        rds_stubber.activate()
+        cw_stubber.activate()
+
+        # Inject stubbed clients
+        rule._rds_client = rds_client
+        rule._cw_client = cw_client
+
+        result = rule.execute()
+
+        rds_stubber.deactivate()
+        cw_stubber.deactivate()
+
+        assert len(result.findings) == 1
+        finding = result.findings[0]
+
+        # db.m5.large hourly rate is 0.171
+        # Monthly cost = 0.171 * 730 = 124.83
+        # Expected savings = 124.83 * 0.30 = 37.449, rounded to 37.45
+        expected_monthly_cost = OversizedRdsRule.RDS_PRICING["db.m5.large"] * 730
+        expected_savings = round(expected_monthly_cost * OversizedRdsRule.SAVINGS_RATIO, 2)
+
+        assert finding.est_monthly_saved_usd == expected_savings
+
+    def test_oversized_rds_no_metrics_data(self):
+        """Test rule handles instances without CloudWatch metrics gracefully."""
+        rule = OversizedRdsRule()
+
+        # Setup RDS stubber
+        rds_client = boto3.client('rds', region_name='us-east-1')
+        rds_stubber = Stubber(rds_client)
+
+        # Mock DescribeDBInstances response
+        rds_stubber.add_response(
+            'describe_db_instances',
+            {
+                'DBInstances': [{
+                    'DBInstanceIdentifier': 'new-db',
+                    'DBInstanceClass': 'db.m5.large',
+                    'DBInstanceArn': 'arn:aws:rds:us-east-1:123456789012:db:new-db',
+                    'DBInstanceStatus': 'available'
+                }]
+            }
+        )
+
+        # Setup CloudWatch stubber
+        cw_client = boto3.client('cloudwatch', region_name='us-east-1')
+        cw_stubber = Stubber(cw_client)
+
+        # Mock GetMetricStatistics response with NO datapoints
+        cw_stubber.add_response(
+            'get_metric_statistics',
+            {
+                'Datapoints': []
+            }
+        )
+
+        rds_stubber.activate()
+        cw_stubber.activate()
+
+        # Inject stubbed clients
+        rule._rds_client = rds_client
+        rule._cw_client = cw_client
+
+        result = rule.execute()
+
+        rds_stubber.deactivate()
+        cw_stubber.deactivate()
+
+        # Should skip instances without metrics data
+        assert result.rule_id == "oversized-rds"
+        assert result.error is None
+        assert len(result.findings) == 0
+
+    def test_oversized_rds_extends_base_rule(self):
+        """Test that OversizedRdsRule extends BaseRule."""
+        BaseRule = recommend_module.BaseRule
+        assert issubclass(OversizedRdsRule, BaseRule)
