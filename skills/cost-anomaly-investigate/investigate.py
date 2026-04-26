@@ -360,3 +360,407 @@ def get_previous_month_range(date_str: str) -> Tuple[datetime, datetime]:
 
     # Return as (start of prev month, start of current month)
     return (previous_month_start, current_month_start)
+
+
+# ============================================================================
+# CostAnomalyInvestigator Class
+# ============================================================================
+
+class CostAnomalyInvestigator:
+    """
+    Orchestrates cost spike investigation via Phase 1, CloudWatch, and CloudTrail.
+
+    Does NOT perform validation; assumes caller has validated date and service.
+    Propagates all AWS exceptions (NoCredentialsError, ClientError) to caller.
+    """
+
+    def __init__(self, date: str, service: str):
+        """
+        Initialize investigator.
+
+        Args:
+            date: YYYY-MM-DD string (assumed valid from validate_date)
+            service: AWS service name (assumed valid from validate_service)
+
+        Raises:
+            botocore.exceptions.NoCredentialsError: If boto3 cannot find credentials
+        """
+        self.date = date
+        self.service = service
+        # Lazy initialization of AWS clients (on first use, not in __init__)
+        self._ce_client = None
+        self._cloudwatch = None
+        self._cloudtrail = None
+
+    def detect_spike(self) -> SpikeSummary:
+        """
+        Detect cost spike using Phase 1 query.py.
+
+        Compares spike_date cost to previous month average:
+        - baseline = average daily cost of previous calendar month
+        - spike = cost on target date
+        - delta = spike - baseline
+        - delta_percent = (delta / baseline * 100) if baseline > 0 else 0.0
+
+        Edge Case (Previous Month Unavailable):
+        If previous month has zero data:
+          - baseline_cost = 0.0
+          - delta_percent = 0.0 (undefined ratio)
+          - Any spike_cost > 0 is treated as a spike (delta > 0)
+          - Caller should note "No baseline available" in report
+
+        Returns:
+            SpikeSummary object with spike details
+
+        Raises:
+            botocore.exceptions.NoCredentialsError: If credentials missing
+            botocore.exceptions.ClientError: If Cost Explorer API fails
+            ValueError: If date parsing fails (shouldn't happen; caller validated)
+        """
+        # Import here to avoid circular imports
+        # Note: Module name has hyphen, but import uses underscore via importlib
+        import importlib
+        query_module = importlib.import_module('skills.cost-explorer-query.query')
+        CostExplorerClient = query_module.CostExplorerClient
+
+        # Get previous month range for baseline
+        prev_start, prev_end = get_previous_month_range(self.date)
+
+        # Query previous month costs
+        ce_client = CostExplorerClient()
+        prev_results = ce_client.get_costs(
+            start_date=prev_start.strftime('%Y-%m-%d'),
+            end_date=prev_end.strftime('%Y-%m-%d'),
+            group_by='service'
+        )
+
+        # Calculate baseline (average daily cost of previous month)
+        prev_total = sum(cost for service, cost in prev_results if service == self.service)
+
+        # Get number of days in previous month
+        prev_month_end = prev_end - timedelta(days=1)
+        days_in_prev_month = prev_month_end.day
+        baseline_cost = prev_total / days_in_prev_month if prev_total > 0 else 0.0
+
+        # Query spike date costs
+        spike_start, spike_end = parse_iso_date_to_utc(self.date)
+        spike_results = ce_client.get_costs(
+            start_date=self.date,
+            end_date=self.date,
+            group_by='service'
+        )
+
+        spike_cost = next(
+            (cost for service, cost in spike_results if service == self.service),
+            0.0
+        )
+
+        # Calculate delta and delta_percent
+        delta = spike_cost - baseline_cost
+        delta_percent = (delta / baseline_cost * 100) if baseline_cost > 0 else 0.0
+
+        return SpikeSummary(
+            date=self.date,
+            service=self.service,
+            baseline_cost=baseline_cost,
+            spike_cost=spike_cost,
+            delta=delta,
+            delta_percent=delta_percent
+        )
+
+    def get_cloudwatch_metrics(self) -> Dict[str, List[MetricDatapoint]]:
+        """
+        Fetch CloudWatch metrics for the spike date (24-hour window, 00:00-23:59 UTC).
+
+        Returns dict of metric_name -> list of MetricDatapoint objects.
+        - Metric names are from SERVICE_TO_METRICS[self.service]
+        - Datapoints are fetched with granularity=60 seconds (standard for CloudWatch)
+        - Empty metrics (no data available) are omitted from the result dict
+
+        Returns:
+            Dict mapping metric_name (str) → List[MetricDatapoint]
+            Example: {
+                'CPUUtilization': [MetricDatapoint(...), MetricDatapoint(...), ...],
+                'NetworkIn': [MetricDatapoint(...), ...]
+            }
+            May be empty if no metrics available for the service on that date.
+
+        Raises:
+            botocore.exceptions.NoCredentialsError: If credentials missing
+            botocore.exceptions.ClientError: If CloudWatch API fails
+        """
+        if self._cloudwatch is None:
+            self._cloudwatch = boto3.client('cloudwatch', region_name='us-east-1')
+
+        # Parse date to UTC start/end times (00:00:00 - 23:59:59 UTC)
+        start_time, end_time = parse_iso_date_to_utc(self.date)
+
+        # Get namespace for this service
+        namespace = SERVICE_TO_NAMESPACE[self.service]
+
+        # Get metric names to fetch
+        metric_names = SERVICE_TO_METRICS[self.service]
+
+        results = {}
+
+        for metric_name in metric_names:
+            try:
+                response = self._cloudwatch.get_metric_statistics(
+                    Namespace=namespace,
+                    MetricName=metric_name,
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=60,  # 60-second granularity
+                    Statistics=['Average', 'Sum', 'Maximum']
+                )
+
+                # Parse datapoints
+                datapoints = []
+                for dp in response.get('Datapoints', []):
+                    # Extract the primary statistic (Average preferred, then Sum, then Maximum)
+                    if 'Average' in dp:
+                        value = float(dp['Average'])
+                        statistic = 'Average'
+                    elif 'Sum' in dp:
+                        value = float(dp['Sum'])
+                        statistic = 'Sum'
+                    elif 'Maximum' in dp:
+                        value = float(dp['Maximum'])
+                        statistic = 'Maximum'
+                    else:
+                        continue
+
+                    datapoint = MetricDatapoint(
+                        timestamp=dp['Timestamp'],
+                        value=value,
+                        unit=dp.get('Unit', 'None'),
+                        statistic=statistic
+                    )
+                    datapoints.append(datapoint)
+
+                # Only add to results if we got data
+                if datapoints:
+                    results[metric_name] = sorted(datapoints, key=lambda x: x.timestamp)
+
+            except botocore.exceptions.ClientError as e:
+                # Gracefully skip metrics that don't exist or can't be fetched
+                continue
+
+        return results
+
+    def get_cloudtrail_events(self) -> List[CloudTrailEvent]:
+        """
+        Fetch CloudTrail events for spike date filtered to mutating verbs.
+
+        Calls CloudTrail LookupEvents API with:
+        - ResourceType filter = SERVICE_TO_RESOURCE_TYPE[self.service]
+        - Date range = 24-hour window (00:00-23:59 UTC) on self.date
+        - EventName regex filter = (Create.*|Modify.*|Delete.*|Update.*|Put.*|Post.*)
+          (excludes Get*, Describe*, List* read-only operations)
+
+        Returns:
+            List of CloudTrailEvent objects (sorted by timestamp, oldest first)
+            Empty list if no mutating events found on the date.
+
+        Raises:
+            botocore.exceptions.NoCredentialsError: If credentials missing
+            botocore.exceptions.ClientError: If CloudTrail API fails
+        """
+        if self._cloudtrail is None:
+            self._cloudtrail = boto3.client('cloudtrail', region_name='us-east-1')
+
+        # Parse date to UTC start/end times
+        start_time, end_time = parse_iso_date_to_utc(self.date)
+
+        # Get resource type for this service
+        resource_type = SERVICE_TO_RESOURCE_TYPE[self.service]
+
+        results = []
+        next_token = None
+
+        # Regex pattern for mutating verbs
+        mutating_pattern = re.compile(r'^(Create|Modify|Delete|Update|Put|Post).*')
+
+        while True:
+            # Build request
+            request = {
+                'LookupAttributes': [
+                    {
+                        'AttributeKey': 'ResourceType',
+                        'AttributeValue': resource_type
+                    }
+                ],
+                'StartTime': start_time,
+                'EndTime': end_time,
+                'MaxResults': 50  # pagination
+            }
+
+            if next_token:
+                request['NextToken'] = next_token
+
+            # Call API
+            response = self._cloudtrail.lookup_events(**request)
+
+            # Parse events and filter to mutating verbs
+            for event in response.get('Events', []):
+                event_name = event.get('EventName', '')
+
+                # Filter to mutating verbs only
+                if not mutating_pattern.match(event_name):
+                    continue
+
+                # Parse CloudTrailEvent
+                # CloudTrail API returns Resources with ResourceName and ResourceType
+                resources = event.get('Resources', [])
+                resource_arns = []
+                if resources:
+                    for r in resources:
+                        # Try to construct ARN from ResourceName if available
+                        resource_name = r.get('ResourceName', '')
+                        if resource_name:
+                            resource_arns.append(resource_name)
+
+                ct_event = CloudTrailEvent(
+                    timestamp=event.get('EventTime'),
+                    principal=event.get('Username', ''),
+                    action=event_name,
+                    resource=resource_arns,
+                    source_ip=event.get('SourceIPAddress', '') or ''
+                )
+                results.append(ct_event)
+
+            # Check for pagination
+            next_token = response.get('NextToken')
+            if not next_token:
+                break
+
+        # Sort by timestamp ascending
+        results.sort(key=lambda x: x.timestamp)
+
+        return results
+
+    def investigate(self) -> InvestigationReport:
+        """
+        Orchestrate spike detection, metrics retrieval, and event gathering.
+
+        Calls detect_spike(), get_cloudwatch_metrics(), get_cloudtrail_events() in sequence.
+        Then invokes _derive_causes() to generate likely-cause hypotheses.
+
+        Returns:
+            InvestigationReport with all data assembled
+
+        Raises:
+            Any exception from detect_spike(), get_cloudwatch_metrics(), get_cloudtrail_events()
+            (propagated to caller)
+        """
+        # Call detect_spike
+        spike = self.detect_spike()
+
+        # Call get_cloudwatch_metrics
+        metrics = self.get_cloudwatch_metrics()
+
+        # Call get_cloudtrail_events
+        events = self.get_cloudtrail_events()
+
+        # Call _derive_causes
+        likely_causes = self._derive_causes(spike, metrics, events)
+
+        # Return InvestigationReport
+        return InvestigationReport(
+            spike=spike,
+            metrics=metrics,
+            events=events,
+            likely_causes=likely_causes,
+            investigation_date=datetime.now(timezone.utc)
+        )
+
+    def _derive_causes(
+        self,
+        spike: SpikeSummary,
+        metrics: Dict[str, List[MetricDatapoint]],
+        events: List[CloudTrailEvent]
+    ) -> List[LikelyCause]:
+        """
+        Heuristic rule-based matching to derive likely causes.
+
+        Applies rules in order of specificity; returns 1-3 LikelyCause objects.
+
+        Rules (applied in order; each rule has a threshold and generates a cause hypothesis):
+        1. EC2 Instance Launch Surge: If events contains >= 10 RunInstances actions
+           → Cause: "EC2 instance launch surge (X instances launched)"
+        2. Database Scaling: If events contains ModifyDBInstance or CreateDBInstance
+           → Cause: "Database scaling or provisioning change"
+        3. Data Transfer Spike: If metrics contains NetworkIn or NetworkOut with spike > 50 Mbps
+           → Cause: "Unexpected data transfer volume"
+        4. High Mutation Rate: If total events >= 20
+           → Cause: "Configuration or deployment activity (X mutating events)"
+        5. Fallback: "Unable to determine root cause; review metrics and events for patterns"
+
+        Each rule generates one LikelyCause object. If multiple rules match, return up to 3 most likely.
+        Order LikelyCause objects by rank (1=most likely, 3=least likely).
+
+        Returns:
+            List[LikelyCause] with 1-3 items (never empty; fallback always applied)
+        """
+        causes = []
+
+        # Rule 1: EC2 Instance Launch Surge
+        run_instances_count = sum(1 for e in events if e.action == 'RunInstances')
+        if run_instances_count >= CAUSE_DETECTION_THRESHOLDS['MIN_INSTANCE_LAUNCH_COUNT']:
+            causes.append(LikelyCause(
+                rank=len(causes) + 1,
+                title="EC2 instance launch surge",
+                description=f"{run_instances_count} instances launched on {spike.date}",
+                evidence_count=run_instances_count
+            ))
+
+        # Rule 2: Database Scaling
+        db_events = [e for e in events if e.action in ['ModifyDBInstance', 'CreateDBInstance']]
+        if db_events:
+            causes.append(LikelyCause(
+                rank=len(causes) + 1,
+                title="Database scaling or provisioning change",
+                description=f"Database instances modified or created ({len(db_events)} events)",
+                evidence_count=len(db_events)
+            ))
+
+        # Rule 3: Data Transfer Spike
+        network_metrics = {k: v for k, v in metrics.items() if 'Network' in k or 'Bytes' in k}
+        if network_metrics:
+            for metric_name, datapoints in network_metrics.items():
+                if datapoints:
+                    max_value = max(dp.value for dp in datapoints)
+                    # Check if NetworkOut spike > 50 Mbps (simple heuristic)
+                    if max_value > CAUSE_DETECTION_THRESHOLDS['MIN_NETWORK_SPIKE_MBPS']:
+                        causes.append(LikelyCause(
+                            rank=len(causes) + 1,
+                            title="Unexpected data transfer volume",
+                            description=f"{metric_name} exceeded {CAUSE_DETECTION_THRESHOLDS['MIN_NETWORK_SPIKE_MBPS']} units",
+                            evidence_count=len(datapoints)
+                        ))
+                        break  # Only add this cause once
+
+        # Rule 4: High Mutation Rate
+        if len(events) >= CAUSE_DETECTION_THRESHOLDS['MIN_TOTAL_EVENTS']:
+            causes.append(LikelyCause(
+                rank=len(causes) + 1,
+                title="Configuration or deployment activity",
+                description=f"{len(events)} mutating events detected on {spike.date}",
+                evidence_count=len(events)
+            ))
+
+        # Ensure we always have at least 1 cause (Rule 5: Fallback)
+        if not causes:
+            causes.append(LikelyCause(
+                rank=1,
+                title="Unable to determine root cause",
+                description="Review metrics and events for patterns",
+                evidence_count=0
+            ))
+
+        # Limit to 3 causes and update ranks
+        causes = causes[:3]
+        for i, cause in enumerate(causes, start=1):
+            cause.rank = i
+
+        return causes
