@@ -1,2 +1,170 @@
-# cost-explorer-skills
-Three Claude Code skills wrapping AWS Cost Explorer + CloudWatch + Trusted Advisor for FinOps work. Built phase-by-phase via /ship-prd + SWE-AF.
+# Cost Explorer Query Skill
+
+## Overview
+
+Cost Explorer Query is a Claude Code skill that wraps AWS Cost Explorer's `get-cost-and-usage` API with a developer-friendly CLI interface. It enables engineers to query AWS cost and usage data without writing boto3 boilerplate. The skill accepts start/end dates and grouping dimensions as CLI arguments, calls AWS Cost Explorer, and returns a formatted markdown table sorted by cost with a grand total row. It supports `--dry-run` mode for offline testing with fixture data and provides clear error messages for missing credentials or API permission denial.
+
+## Prerequisites
+
+- Python 3.9 or higher
+- AWS credentials configured via AWS CLI or environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`)
+- boto3 library (installed via `install.sh`)
+
+## Installation
+
+Run the installation script to set up dependencies:
+
+```bash
+./install.sh
+```
+
+This script symlinks the skill into `~/.claude/skills/` and installs required Python packages (boto3, pytest).
+
+## Usage
+
+### Help
+
+```
+usage: query.py [-h] [--start START] [--end END] [--group-by GROUP_BY]
+                [--dry-run]
+
+Query AWS Cost Explorer for cost and usage data
+
+options:
+  -h, --help           show this help message and exit
+  --start START        Start date in YYYY-MM-DD format
+  --end END            End date in YYYY-MM-DD format
+  --group-by GROUP_BY  Grouping dimension: service, account, linked-account,
+                       or tag:<name>
+  --dry-run            Use fixture data instead of querying AWS (for testing)
+```
+
+### Arguments
+
+- `--start YYYY-MM-DD` (required unless `--dry-run`) — Start date for cost query
+- `--end YYYY-MM-DD` (required unless `--dry-run`) — End date for cost query
+- `--group-by {service|account|linked-account|tag:<name>}` (required unless `--dry-run`) — Group results by dimension:
+  - `service` — AWS service (e.g., EC2, RDS, Lambda, S3)
+  - `account` — Payer account (AWS account number)
+  - `linked-account` — Linked account in consolidated billing
+  - `tag:<tagname>` — Custom tag key (e.g., `tag:Environment`)
+- `--dry-run` (optional) — Use fixture data instead of querying AWS (for testing without credentials)
+
+## Examples
+
+### Example 1: Query costs grouped by service
+
+Query the last 30 days of costs grouped by AWS service in `--dry-run` mode:
+
+```bash
+python skills/cost-explorer-query/query.py --dry-run --group-by service
+```
+
+Expected output:
+
+```
+| Service | Cost USD |
+|---------|----------|
+| EC2 | $1,234.56 |
+| RDS | $567.89 |
+| Lambda | $123.45 |
+| S3 | $89.10 |
+| TOTAL | $2,015.00 |
+```
+
+### Example 2: Query costs grouped by account
+
+Query costs grouped by AWS account number in `--dry-run` mode:
+
+```bash
+python skills/cost-explorer-query/query.py --dry-run --group-by account
+```
+
+Expected output:
+
+```
+| Account | Cost USD |
+|---------|----------|
+| 123456789012 | $1,500.00 |
+| 210987654321 | $800.00 |
+| 345678901234 | $715.00 |
+| TOTAL | $3,015.00 |
+```
+
+### Example 3: Query costs for Q1 2024 grouped by linked-account
+
+Query Q1 2024 (January through March) costs grouped by linked account:
+
+```bash
+python skills/cost-explorer-query/query.py --dry-run --start 2024-01-01 --end 2024-03-31 --group-by linked-account
+```
+
+Expected output:
+
+```
+| Linked Account | Cost USD |
+|----------------|----------|
+| 123456789012 | $1,500.00 |
+| 210987654321 | $800.00 |
+| 345678901234 | $715.00 |
+| TOTAL | $3,015.00 |
+```
+
+## Testing
+
+Run the test suite to verify the skill works correctly:
+
+```bash
+pytest tests/test_query.py -v
+```
+
+All tests use mocked AWS responses (via `botocore.stub.Stubber`) and do not require live AWS credentials or network access. Tests verify:
+- Happy path: Successful cost queries with proper formatting and sorting
+- Error handling: Missing credentials and permission denial scenarios
+- Fixture data: Deterministic output in `--dry-run` mode
+
+## Error Handling
+
+The skill provides clear error messages for common issues:
+
+- **Missing AWS Credentials**: If AWS credentials are not configured, the skill outputs:
+  ```
+  Error: AWS credentials not found. Configure credentials via AWS CLI or environment variables.
+  ```
+  Exit code: 1
+
+- **Permission Denied**: If the AWS account lacks `ce:GetCostAndUsage` permission, the skill outputs:
+  ```
+  Error: AWS Cost Explorer API access denied. Ensure IAM permissions include ce:GetCostAndUsage.
+  ```
+  Exit code: 1
+
+- **Invalid Arguments**: If CLI arguments are malformed (e.g., invalid date format), argparse prints usage and exits with code 2.
+
+## Project Structure
+
+```
+.
+├── README.md                          # This file
+├── LICENSE                            # Apache License 2.0
+├── pyproject.toml                     # Project metadata and dependencies
+├── install.sh                         # Installation script
+├── skills/
+│   └── cost-explorer-query/
+│       ├── SKILL.md                   # Skill metadata
+│       └── query.py                   # Main CLI implementation
+└── tests/
+    └── test_query.py                  # Pytest test suite
+```
+
+## License
+
+This project is licensed under the Apache License 2.0. See the `LICENSE` file for details.
+
+## Notes
+
+- **Costs**: All costs are in USD (UnblendedCost metric) with 2 decimal places and thousands separators.
+- **Sorting**: Results are sorted descending by cost (highest cost first).
+- **Pagination**: The skill automatically handles AWS Cost Explorer pagination; large result sets are aggregated transparently.
+- **Date Format**: Dates must be in strict `YYYY-MM-DD` format (e.g., `2024-01-15`). No fuzzy parsing is supported.
+- **Fixture Data**: The `--dry-run` mode returns representative sample data for testing without AWS access. This data is static and deterministic.
