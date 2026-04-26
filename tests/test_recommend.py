@@ -32,6 +32,7 @@ spec.loader.exec_module(recommend_module)
 Finding = recommend_module.Finding
 RuleResult = recommend_module.RuleResult
 FixtureProvider = recommend_module.FixtureProvider
+ReportGenerator = recommend_module.ReportGenerator
 
 
 # ============================================================================
@@ -468,3 +469,358 @@ class TestNoAWSCalls:
         # Verify we can get filtered results (no AWS dependencies)
         results = FixtureProvider.get_fixture_results_for_rules(["idle-ec2"])
         assert len(results) == 1, "Should return filtered results without any AWS calls"
+
+
+# ============================================================================
+# Tests for ReportGenerator Class
+# ============================================================================
+
+class TestReportGenerator:
+    """Test ReportGenerator class for markdown output."""
+
+    def test_report_sorted_by_savings_descending(self):
+        """Findings in report are sorted by est_monthly_saved_usd descending (highest first)."""
+        generator = ReportGenerator()
+
+        # Create findings with known savings values in mixed order
+        results = [
+            RuleResult(
+                rule_id="idle-ec2",
+                findings=[
+                    Finding(
+                        arn="arn:aws:ec2:us-east-1:123:instance/i-low",
+                        finding="Low savings finding",
+                        est_monthly_saved_usd=10.00,
+                        fix_command="aws ec2 stop-instances --instance-ids i-low"
+                    )
+                ],
+                error=None
+            ),
+            RuleResult(
+                rule_id="orphan-ebs",
+                findings=[
+                    Finding(
+                        arn="arn:aws:ec2:us-east-1:123:volume/vol-high",
+                        finding="High savings finding",
+                        est_monthly_saved_usd=200.00,
+                        fix_command="aws ec2 delete-volume --volume-id vol-high"
+                    )
+                ],
+                error=None
+            ),
+            RuleResult(
+                rule_id="oversized-rds",
+                findings=[
+                    Finding(
+                        arn="arn:aws:rds:us-east-1:123:db:mydb",
+                        finding="Medium savings finding",
+                        est_monthly_saved_usd=50.00,
+                        fix_command="aws rds modify-db-instance --db-instance-identifier mydb"
+                    )
+                ],
+                error=None
+            ),
+        ]
+
+        output = generator.generate(results, ["idle-ec2", "orphan-ebs", "oversized-rds"])
+
+        # Extract savings values from report (they appear in table rows)
+        import re
+        savings_matches = re.findall(r'\$(\d+(?:,\d{3})*\.\d{2})', output)
+
+        # Filter out the total row (last one) and convert to floats
+        savings_in_table = []
+        for match in savings_matches:
+            value = float(match.replace(',', ''))
+            savings_in_table.append(value)
+
+        # The total savings is the last value; remove it
+        if savings_in_table:
+            # The report has findings table values followed by total
+            # Total is 260.00, so findings should be before that
+            findings_savings = [s for s in savings_in_table if s != 260.00]
+
+            # Should be sorted descending: 200.00, 50.00, 10.00
+            assert findings_savings == sorted(findings_savings, reverse=True), (
+                f"Findings not sorted descending: {findings_savings}"
+            )
+
+    def test_report_header_includes_required_elements(self):
+        """Report header includes title, timestamp, and rules executed."""
+        generator = ReportGenerator()
+        results = FixtureProvider.get_fixture_results()
+        rules_executed = ["idle-ec2", "oversized-rds", "orphan-ebs", "untagged-spend"]
+
+        output = generator.generate(results, rules_executed)
+
+        # Check title
+        assert "# FinOps Recommendations Report" in output
+
+        # Check timestamp format (Generated: YYYY-MM-DDTHH:MM:SSZ)
+        import re
+        assert re.search(r'Generated: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z', output), (
+            "Report should contain timestamp in ISO format"
+        )
+
+        # Check rules executed
+        assert "Rules executed:" in output
+        for rule in rules_executed:
+            assert rule in output, f"Rule '{rule}' should be in rules executed list"
+
+    def test_report_includes_rule_errors_section_when_errors_present(self):
+        """Report includes Rule Errors section when at least one rule has error set."""
+        generator = ReportGenerator()
+
+        results = [
+            RuleResult(
+                rule_id="idle-ec2",
+                findings=[],
+                error="AccessDeniedException: User not authorized"
+            ),
+            RuleResult(
+                rule_id="orphan-ebs",
+                findings=[
+                    Finding(
+                        arn="arn:aws:ec2:us-east-1:123:volume/vol-x",
+                        finding="test finding",
+                        est_monthly_saved_usd=10.00,
+                        fix_command="aws ec2 delete-volume --volume-id vol-x"
+                    )
+                ],
+                error=None
+            ),
+        ]
+
+        output = generator.generate(results, ["idle-ec2", "orphan-ebs"])
+
+        # Verify Rule Errors section exists
+        assert "## Rule Errors" in output
+        assert "idle-ec2" in output
+        assert "AccessDeniedException" in output or "User not authorized" in output
+
+        # Verify successful findings also appear
+        assert "vol-x" in output
+
+    def test_report_no_rule_errors_section_when_all_succeed(self):
+        """Report does NOT include Rule Errors section when all rules succeed."""
+        generator = ReportGenerator()
+
+        results = [
+            RuleResult(
+                rule_id="idle-ec2",
+                findings=[
+                    Finding(
+                        arn="arn:aws:ec2:us-east-1:123:instance/i-test",
+                        finding="test finding",
+                        est_monthly_saved_usd=100.00,
+                        fix_command="aws ec2 stop-instances --instance-ids i-test"
+                    )
+                ],
+                error=None
+            ),
+        ]
+
+        output = generator.generate(results, ["idle-ec2"])
+
+        # Rule Errors section should NOT be present
+        assert "## Rule Errors" not in output
+
+    def test_report_empty_findings_shows_message(self):
+        """Report shows 'No findings' message when no findings."""
+        generator = ReportGenerator()
+
+        results = [
+            RuleResult(rule_id="idle-ec2", findings=[], error=None),
+            RuleResult(rule_id="orphan-ebs", findings=[], error=None),
+        ]
+
+        output = generator.generate(results, ["idle-ec2", "orphan-ebs"])
+
+        assert "No findings" in output
+
+    def test_report_total_savings_calculation(self):
+        """Total estimated monthly savings is correct."""
+        generator = ReportGenerator()
+
+        results = [
+            RuleResult(
+                rule_id="idle-ec2",
+                findings=[
+                    Finding(
+                        arn="arn:aws:ec2:us-east-1:123:instance/i-1",
+                        finding="Finding 1",
+                        est_monthly_saved_usd=100.50,
+                        fix_command="aws ec2 stop-instances --instance-ids i-1"
+                    )
+                ],
+                error=None
+            ),
+            RuleResult(
+                rule_id="orphan-ebs",
+                findings=[
+                    Finding(
+                        arn="arn:aws:ec2:us-east-1:123:volume/vol-1",
+                        finding="Finding 2",
+                        est_monthly_saved_usd=50.25,
+                        fix_command="aws ec2 delete-volume --volume-id vol-1"
+                    )
+                ],
+                error=None
+            ),
+        ]
+
+        output = generator.generate(results, ["idle-ec2", "orphan-ebs"])
+
+        # Total should be 100.50 + 50.25 = 150.75
+        assert "Total estimated monthly savings: $150.75" in output
+
+    def test_report_savings_formatting_with_commas(self):
+        """Savings are formatted as $X,XXX.XX with dollar sign, commas, and two decimals."""
+        generator = ReportGenerator()
+
+        results = [
+            RuleResult(
+                rule_id="idle-ec2",
+                findings=[
+                    Finding(
+                        arn="arn:aws:ec2:us-east-1:123:instance/i-1",
+                        finding="High savings",
+                        est_monthly_saved_usd=1234.56,
+                        fix_command="aws ec2 stop-instances --instance-ids i-1"
+                    )
+                ],
+                error=None
+            ),
+        ]
+
+        output = generator.generate(results, ["idle-ec2"])
+
+        # Check formatting with dollar sign, comma, and two decimals
+        assert "$1,234.56" in output
+
+    def test_report_large_savings_formatting_with_multiple_commas(self):
+        """Large savings are formatted correctly with multiple commas."""
+        generator = ReportGenerator()
+
+        results = [
+            RuleResult(
+                rule_id="idle-ec2",
+                findings=[
+                    Finding(
+                        arn="arn:aws:ec2:us-east-1:123:instance/i-1",
+                        finding="Very high savings",
+                        est_monthly_saved_usd=12345678.90,
+                        fix_command="aws ec2 stop-instances --instance-ids i-1"
+                    )
+                ],
+                error=None
+            ),
+        ]
+
+        output = generator.generate(results, ["idle-ec2"])
+
+        # Check formatting with multiple commas
+        assert "$12,345,678.90" in output
+
+    def test_report_findings_table_has_correct_columns(self):
+        """Findings table has columns: ARN, Finding, Est. Monthly Savings, Fix Command."""
+        generator = ReportGenerator()
+        results = FixtureProvider.get_fixture_results()
+
+        output = generator.generate(
+            results,
+            ["idle-ec2", "oversized-rds", "orphan-ebs", "untagged-spend"]
+        )
+
+        # Check column headers exist
+        assert "| ARN |" in output
+        assert "| Finding |" in output or "Finding |" in output
+        assert "Est. Monthly Savings" in output
+        assert "Fix Command" in output
+
+    def test_report_rule_errors_table_shows_rule_id_and_error(self):
+        """Rule Errors table shows rule_id and error message."""
+        generator = ReportGenerator()
+
+        results = [
+            RuleResult(
+                rule_id="idle-ec2",
+                findings=[],
+                error="Simulated failure message"
+            ),
+            RuleResult(
+                rule_id="orphan-ebs",
+                findings=[],
+                error="Another error occurred"
+            ),
+        ]
+
+        output = generator.generate(results, ["idle-ec2", "orphan-ebs"])
+
+        # Check errors section exists and contains both errors
+        assert "## Rule Errors" in output
+        assert "idle-ec2" in output
+        assert "Simulated failure message" in output
+        assert "orphan-ebs" in output
+        assert "Another error occurred" in output
+
+    def test_report_excludes_findings_from_failed_rules(self):
+        """Findings from rules with errors are NOT included in total savings."""
+        generator = ReportGenerator()
+
+        results = [
+            # This rule has error AND findings - findings should be excluded
+            RuleResult(
+                rule_id="idle-ec2",
+                findings=[
+                    Finding(
+                        arn="arn:aws:ec2:us-east-1:123:instance/i-should-be-ignored",
+                        finding="This should be ignored",
+                        est_monthly_saved_usd=1000.00,
+                        fix_command="aws ec2 stop-instances --instance-ids i-should-be-ignored"
+                    )
+                ],
+                error="This rule failed"  # Error is set, so findings shouldn't count
+            ),
+            RuleResult(
+                rule_id="orphan-ebs",
+                findings=[
+                    Finding(
+                        arn="arn:aws:ec2:us-east-1:123:volume/vol-good",
+                        finding="This should be included",
+                        est_monthly_saved_usd=50.00,
+                        fix_command="aws ec2 delete-volume --volume-id vol-good"
+                    )
+                ],
+                error=None
+            ),
+        ]
+
+        output = generator.generate(results, ["idle-ec2", "orphan-ebs"])
+
+        # Total should only be 50.00 (not 1050.00)
+        assert "Total estimated monthly savings: $50.00" in output
+
+    def test_report_fix_command_formatted_in_backticks(self):
+        """Fix commands are wrapped in backticks in the table."""
+        generator = ReportGenerator()
+
+        results = [
+            RuleResult(
+                rule_id="idle-ec2",
+                findings=[
+                    Finding(
+                        arn="arn:aws:ec2:us-east-1:123:instance/i-test",
+                        finding="test",
+                        est_monthly_saved_usd=100.00,
+                        fix_command="aws ec2 stop-instances --instance-ids i-test"
+                    )
+                ],
+                error=None
+            ),
+        ]
+
+        output = generator.generate(results, ["idle-ec2"])
+
+        # Fix command should be wrapped in backticks
+        assert "`aws ec2 stop-instances --instance-ids i-test`" in output
