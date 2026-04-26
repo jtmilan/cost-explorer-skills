@@ -1021,3 +1021,136 @@ class ReportGenerator:
                 for finding in result.findings:
                     total += finding.est_monthly_saved_usd
         return total
+
+
+# ============================================================================
+# CLI Interface
+# ============================================================================
+
+import argparse
+from typing import Type
+
+
+# Rule registry maps rule_id to rule class
+RULE_REGISTRY: Dict[str, Type[BaseRule]] = {
+    "idle-ec2": IdleEc2Rule,
+    "oversized-rds": OversizedRdsRule,
+    "orphan-ebs": OrphanEbsRule,
+    "untagged-spend": UntaggedSpendRule,
+}
+
+
+# Valid rule IDs for validation
+VALID_RULES = {"idle-ec2", "oversized-rds", "orphan-ebs", "untagged-spend"}
+
+
+def validate_rules(rules_str: str) -> List[str]:
+    """Validate and parse --rules comma-separated list.
+
+    Args:
+        rules_str: Comma-separated rule IDs (e.g., "idle-ec2,orphan-ebs")
+
+    Returns:
+        List of valid rule IDs
+
+    Raises:
+        argparse.ArgumentTypeError: If any rule ID is invalid
+
+    Valid rule IDs: idle-ec2, oversized-rds, orphan-ebs, untagged-spend
+    """
+    rules = [r.strip() for r in rules_str.split(",")]
+    invalid = set(rules) - VALID_RULES
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"Invalid rules: {', '.join(invalid)}. "
+            f"Valid options: {', '.join(sorted(VALID_RULES))}"
+        )
+    return rules
+
+
+def execute_rules(rule_ids: List[str]) -> List[RuleResult]:
+    """Execute specified rules, catching all errors.
+
+    Args:
+        rule_ids: List of rule IDs to execute
+
+    Returns:
+        List of RuleResult objects (one per rule)
+
+    Behavior:
+        - Rules execute independently
+        - Errors in one rule don't affect others
+        - Each rule catches its own exceptions
+        - Results returned in same order as rule_ids
+    """
+    results = []
+    for rule_id in rule_ids:
+        rule_class = RULE_REGISTRY[rule_id]
+        rule = rule_class()
+        result = rule.execute()
+        results.append(result)
+    return results
+
+
+def main() -> int:
+    """CLI entry point.
+
+    Arguments:
+        --dry-run: Use fixture data (no AWS calls)
+        --rules RULES: Comma-separated rule subset (default: all)
+
+    Returns:
+        0: At least one rule succeeded
+        1: All rules failed
+        2: Argument validation error (handled by argparse)
+
+    Behavior:
+        1. Parse arguments
+        2. Determine which rules to execute
+        3. If --dry-run: use FixtureProvider
+        4. Else: instantiate and execute each rule
+        5. Generate and print report
+        6. Return appropriate exit code
+    """
+    parser = argparse.ArgumentParser(
+        description="Scan AWS account for cost optimization opportunities"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Use fixture data (no AWS calls)"
+    )
+    parser.add_argument(
+        "--rules",
+        type=validate_rules,
+        default=None,
+        help="Comma-separated rule subset (default: all). "
+             "Valid: idle-ec2,oversized-rds,orphan-ebs,untagged-spend"
+    )
+
+    args = parser.parse_args()
+
+    # Determine rules to execute
+    all_rules = ["idle-ec2", "oversized-rds", "orphan-ebs", "untagged-spend"]
+    rules_to_execute = args.rules if args.rules else all_rules
+
+    # Execute
+    if args.dry_run:
+        results = FixtureProvider.get_fixture_results_for_rules(rules_to_execute)
+    else:
+        results = execute_rules(rules_to_execute)
+
+    # Generate report
+    generator = ReportGenerator()
+    report = generator.generate(results, rules_to_execute)
+    print(report)
+
+    # Determine exit code
+    successful = any(r.error is None for r in results)
+    return 0 if successful else 1
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())
