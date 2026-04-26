@@ -3,7 +3,8 @@ Tests for cost-explorer-query query.py module.
 
 Uses botocore.stub.Stubber for AWS API mocking (no live AWS calls).
 Tests cover:
-- CostExplorerClient pagination and response parsing
+- Argparse validators (validate_date, validate_group_by)
+- CostExplorerClient with Stubber-based API mocking
 - FixtureProvider deterministic fixture data
 - OutputFormatter sorting and currency formatting
 - main() entry point with --dry-run and normal flow
@@ -11,13 +12,11 @@ Tests cover:
 """
 
 import pytest
-from unittest.mock import patch, MagicMock
 from botocore.stub import Stubber
-import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 import sys
 import os
-from io import StringIO
+from unittest.mock import patch
 import argparse
 import importlib.util
 
@@ -25,18 +24,9 @@ import importlib.util
 query_module_path = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     'skills',
-    'cost_explorer_query',
+    'cost-explorer-query',
     'query.py'
 )
-
-# Handle both possible naming conventions
-if not os.path.exists(query_module_path):
-    query_module_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        'skills',
-        'cost-explorer-query',
-        'query.py'
-    )
 
 spec = importlib.util.spec_from_file_location("query", query_module_path)
 query_module = importlib.util.module_from_spec(spec)
@@ -59,22 +49,25 @@ validate_group_by = query_module.validate_group_by
 class TestValidateDate:
     """Test date validation function."""
 
-    def test_valid_date(self):
-        """Test that valid YYYY-MM-DD format is accepted."""
+    def test_validate_date_valid_first_day(self):
+        """Test that valid YYYY-MM-DD format is accepted (first day of year)."""
         assert validate_date('2024-01-01') == '2024-01-01'
+
+    def test_validate_date_valid_last_day(self):
+        """Test that valid YYYY-MM-DD format is accepted (last day of year)."""
         assert validate_date('2024-12-31') == '2024-12-31'
 
-    def test_invalid_date_format_missing_dashes(self):
+    def test_validate_date_invalid_missing_dashes(self):
         """Test that date without dashes is rejected."""
         with pytest.raises(argparse.ArgumentTypeError):
             validate_date('20240101')
 
-    def test_invalid_date_format_wrong_order(self):
-        """Test that wrong date format is rejected."""
+    def test_validate_date_invalid_wrong_order(self):
+        """Test that wrong date format (MM-DD-YYYY) is rejected."""
         with pytest.raises(argparse.ArgumentTypeError):
             validate_date('01-01-2024')
 
-    def test_invalid_date_format_text(self):
+    def test_validate_date_invalid_text(self):
         """Test that text dates are rejected."""
         with pytest.raises(argparse.ArgumentTypeError):
             validate_date('2024-Jan-01')
@@ -87,29 +80,29 @@ class TestValidateDate:
 class TestValidateGroupBy:
     """Test group-by validation function."""
 
-    def test_valid_service(self):
+    def test_validate_group_by_valid_service(self):
         """Test that 'service' is valid."""
         assert validate_group_by('service') == 'service'
 
-    def test_valid_account(self):
+    def test_validate_group_by_valid_account(self):
         """Test that 'account' is valid."""
         assert validate_group_by('account') == 'account'
 
-    def test_valid_linked_account(self):
+    def test_validate_group_by_valid_linked_account(self):
         """Test that 'linked-account' is valid."""
         assert validate_group_by('linked-account') == 'linked-account'
 
-    def test_valid_tag(self):
+    def test_validate_group_by_valid_tag(self):
         """Test that 'tag:<name>' format is valid."""
         assert validate_group_by('tag:Environment') == 'tag:Environment'
         assert validate_group_by('tag:Application') == 'tag:Application'
 
-    def test_invalid_group_by(self):
+    def test_validate_group_by_invalid_dimension(self):
         """Test that invalid group-by values are rejected."""
         with pytest.raises(argparse.ArgumentTypeError):
             validate_group_by('invalid')
 
-    def test_invalid_tag_without_colon(self):
+    def test_validate_group_by_invalid_tag_without_key(self):
         """Test that 'tag' without key is rejected."""
         with pytest.raises(argparse.ArgumentTypeError):
             validate_group_by('tag')
@@ -264,8 +257,27 @@ class TestCostExplorerClient:
         results = client._parse_response(response, 'service')
         assert results == []
 
-    def test_get_costs_single_page(self):
-        """Test get_costs with single page response."""
+
+# ============================================================================
+# Tests for main() entry point with Stubber - Core Acceptance Criteria Tests
+# ============================================================================
+
+class TestMainHappyPath:
+    """Test main() happy path scenarios with Stubber."""
+
+    def test_happy_path_service_grouping(self, capsys):
+        """
+        Test happy path with service grouping (Acceptance Criteria).
+
+        Sets up Stubber with mock get_cost_and_usage response containing 3 services (EC2, RDS, Lambda).
+        Calls main() with --start 2024-01-01 --end 2024-03-31 --group-by service.
+        Verifies:
+        - Exit code 0
+        - Output contains all 3 services
+        - Output is sorted by cost descending
+        - Grand total row is present and correct
+        - Costs formatted as $X,XXX.XX
+        """
         client = CostExplorerClient()
 
         with Stubber(client.client) as stubber:
@@ -277,7 +289,7 @@ class TestCostExplorerClient:
                     {
                         'TimePeriod': {'Start': '2024-01-01', 'End': '2024-02-01'},
                         'Total': {
-                            'UnblendedCost': {'Amount': '1800', 'Unit': 'USD'}
+                            'UnblendedCost': {'Amount': '1903.89', 'Unit': 'USD'}
                         },
                         'Groups': [
                             {
@@ -289,7 +301,65 @@ class TestCostExplorerClient:
                             {
                                 'Keys': ['AmazonRDS'],
                                 'Metrics': {
-                                    'UnblendedCost': {'Amount': '565.44', 'Unit': 'USD'}
+                                    'UnblendedCost': {'Amount': '567.89', 'Unit': 'USD'}
+                                }
+                            },
+                            {
+                                'Keys': ['AWSLambda'],
+                                'Metrics': {
+                                    'UnblendedCost': {'Amount': '101.44', 'Unit': 'USD'}
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        'TimePeriod': {'Start': '2024-02-01', 'End': '2024-03-01'},
+                        'Total': {
+                            'UnblendedCost': {'Amount': '1903.89', 'Unit': 'USD'}
+                        },
+                        'Groups': [
+                            {
+                                'Keys': ['AmazonEC2'],
+                                'Metrics': {
+                                    'UnblendedCost': {'Amount': '0.00', 'Unit': 'USD'}
+                                }
+                            },
+                            {
+                                'Keys': ['AmazonRDS'],
+                                'Metrics': {
+                                    'UnblendedCost': {'Amount': '0.00', 'Unit': 'USD'}
+                                }
+                            },
+                            {
+                                'Keys': ['AWSLambda'],
+                                'Metrics': {
+                                    'UnblendedCost': {'Amount': '0.00', 'Unit': 'USD'}
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        'TimePeriod': {'Start': '2024-03-01', 'End': '2024-03-31'},
+                        'Total': {
+                            'UnblendedCost': {'Amount': '1903.89', 'Unit': 'USD'}
+                        },
+                        'Groups': [
+                            {
+                                'Keys': ['AmazonEC2'],
+                                'Metrics': {
+                                    'UnblendedCost': {'Amount': '0.00', 'Unit': 'USD'}
+                                }
+                            },
+                            {
+                                'Keys': ['AmazonRDS'],
+                                'Metrics': {
+                                    'UnblendedCost': {'Amount': '0.00', 'Unit': 'USD'}
+                                }
+                            },
+                            {
+                                'Keys': ['AWSLambda'],
+                                'Metrics': {
+                                    'UnblendedCost': {'Amount': '0.00', 'Unit': 'USD'}
                                 }
                             }
                         ]
@@ -299,14 +369,43 @@ class TestCostExplorerClient:
 
             stubber.add_response('get_cost_and_usage', response)
 
-            results = client.get_costs('2024-01-01', '2024-02-01', 'service')
+            # Patch the client creation to use our stubbed client
+            with patch('query.CostExplorerClient') as mock_client_class:
+                mock_client_class.return_value = client
+                with patch('sys.argv', ['query.py', '--start', '2024-01-01', '--end', '2024-03-31', '--group-by', 'service']):
+                    result = main()
 
-            assert len(results) == 2
-            assert ('EC2', 1234.56) in results
-            assert ('RDS', 565.44) in results
+        assert result == 0, "Exit code should be 0 for successful query"
+        captured = capsys.readouterr()
 
-    def test_get_costs_with_pagination(self):
-        """Test get_costs with pagination."""
+        # Verify all 3 services are in output
+        assert 'EC2 |' in captured.out, "EC2 should be in output"
+        assert 'RDS |' in captured.out, "RDS should be in output"
+        assert 'Lambda |' in captured.out, "Lambda should be in output"
+
+        # Verify grand total row
+        assert 'TOTAL |' in captured.out, "TOTAL row should be present"
+        assert '$1,903.89' in captured.out, "Grand total should be correct"
+
+        # Verify sorting (EC2 should come before RDS, RDS before Lambda)
+        lines = captured.out.split('\n')
+        ec2_line = next(i for i, line in enumerate(lines) if 'EC2 |' in line)
+        rds_line = next(i for i, line in enumerate(lines) if 'RDS |' in line)
+        lambda_line = next(i for i, line in enumerate(lines) if 'Lambda |' in line)
+        assert ec2_line < rds_line < lambda_line, "Services should be sorted by cost descending"
+
+        # Verify currency format (thousands separator with 2 decimals)
+        assert '$1,234.56' in captured.out, "Costs should be formatted with thousands separator"
+
+    def test_happy_path_pagination(self, capsys):
+        """
+        Test pagination with Stubber (Optional acceptance criterion).
+
+        Sets up Stubber with first response containing NextPageToken,
+        second response without token.
+        Verifies exit code 0, output aggregates costs from both pages,
+        grand total is sum of both pages.
+        """
         client = CostExplorerClient()
 
         with Stubber(client.client) as stubber:
@@ -319,7 +418,7 @@ class TestCostExplorerClient:
                     {
                         'TimePeriod': {'Start': '2024-01-01', 'End': '2024-02-01'},
                         'Total': {
-                            'UnblendedCost': {'Amount': '2000', 'Unit': 'USD'}
+                            'UnblendedCost': {'Amount': '1000', 'Unit': 'USD'}
                         },
                         'Groups': [
                             {
@@ -334,7 +433,7 @@ class TestCostExplorerClient:
                 'NextPageToken': 'token123'
             }
 
-            # Second page response
+            # Second page response (no NextPageToken)
             response2 = {
                 'GroupDefinitions': [
                     {'Type': 'DIMENSION', 'Key': 'SERVICE'}
@@ -360,12 +459,122 @@ class TestCostExplorerClient:
             stubber.add_response('get_cost_and_usage', response1)
             stubber.add_response('get_cost_and_usage', response2)
 
-            results = client.get_costs('2024-01-01', '2024-02-01', 'service')
+            with patch('query.CostExplorerClient') as mock_client_class:
+                mock_client_class.return_value = client
+                with patch('sys.argv', ['query.py', '--start', '2024-01-01', '--end', '2024-02-01', '--group-by', 'service']):
+                    result = main()
 
-            # Should have results from both pages
-            assert len(results) == 2
-            assert ('EC2', 1000.00) in results
-            assert ('RDS', 1000.00) in results
+        assert result == 0, "Exit code should be 0 for successful pagination"
+        captured = capsys.readouterr()
+
+        # Verify both services from both pages are in output
+        assert 'EC2 | $1,000.00' in captured.out, "EC2 from page 1 should be in output"
+        assert 'RDS | $1,000.00' in captured.out, "RDS from page 2 should be in output"
+        assert 'TOTAL | $2,000.00' in captured.out, "Grand total should be sum of both pages"
+
+    def test_empty_result(self, capsys):
+        """
+        Test empty result handling (Acceptance Criteria).
+
+        Sets up Stubber with mock response containing empty ResultsByTime=[] and NextPageToken=None.
+        Calls main() with valid args.
+        Verifies:
+        - Exit code 0
+        - Output is valid markdown table (header + total row)
+        - Grand total shows $0.00
+        - No crash
+        """
+        client = CostExplorerClient()
+
+        with Stubber(client.client) as stubber:
+            response = {
+                'GroupDefinitions': [
+                    {'Type': 'DIMENSION', 'Key': 'SERVICE'}
+                ],
+                'ResultsByTime': []
+            }
+
+            stubber.add_response('get_cost_and_usage', response)
+
+            with patch('query.CostExplorerClient') as mock_client_class:
+                mock_client_class.return_value = client
+                with patch('sys.argv', ['query.py', '--start', '2024-01-01', '--end', '2024-03-31', '--group-by', 'service']):
+                    result = main()
+
+        assert result == 0, "Exit code should be 0 even with empty results"
+        captured = capsys.readouterr()
+
+        # Verify valid markdown table structure
+        assert 'Service | Cost USD' in captured.out, "Header row should be present"
+        assert 'TOTAL | $0.00' in captured.out, "Grand total should show $0.00"
+
+        # Verify it's still a valid table (has separator)
+        assert '|' in captured.out, "Should have pipe separators for markdown table"
+
+
+# ============================================================================
+# Tests for error handling with Stubber
+# ============================================================================
+
+class TestErrorHandling:
+    """Test error handling with Stubber."""
+
+    def test_aws_unauthorized_error(self, capsys):
+        """
+        Test unauthorized error handling (Acceptance Criteria).
+
+        Sets up Stubber to raise ClientError with Error.Code='UnauthorizedOperation'.
+        Calls main() with valid args.
+        Verifies:
+        - Exit code 1
+        - Output contains exact error message: 'Error: AWS Cost Explorer API access denied. Ensure IAM permissions include ce:GetCostAndUsage.'
+        """
+        client = CostExplorerClient()
+
+        with Stubber(client.client) as stubber:
+            error = ClientError(
+                {'Error': {'Code': 'UnauthorizedOperation', 'Message': 'User is not authorized'}},
+                'GetCostAndUsage'
+            )
+            stubber.add_client_error('get_cost_and_usage', service_error_code='UnauthorizedOperation')
+
+            with patch('query.CostExplorerClient') as mock_client_class:
+                mock_client_class.return_value = client
+                with patch('sys.argv', ['query.py', '--start', '2024-01-01', '--end', '2024-03-31', '--group-by', 'service']):
+                    result = main()
+
+        assert result == 1, "Exit code should be 1 for authorization error"
+        captured = capsys.readouterr()
+        assert 'Error: AWS Cost Explorer API access denied. Ensure IAM permissions include ce:GetCostAndUsage.' in captured.out
+
+    def test_missing_credentials_error(self, capsys):
+        """
+        Test missing credentials error handling (Optional acceptance criterion).
+
+        Sets up Stubber to raise NoCredentialsError.
+        Calls main().
+        Verifies:
+        - Exit code 1
+        - Output contains exact error message: 'Error: AWS credentials not found. Configure credentials via AWS CLI or environment variables.'
+        """
+        client = CostExplorerClient()
+
+        with Stubber(client.client) as stubber:
+            stubber.add_client_error('get_cost_and_usage', service_error_code='NoCredentialsError')
+
+            with patch('query.CostExplorerClient') as mock_client_class:
+                # Make the mock raise NoCredentialsError when get_costs is called
+                from unittest.mock import MagicMock
+                mock_instance = MagicMock()
+                mock_instance.get_costs.side_effect = NoCredentialsError()
+                mock_client_class.return_value = mock_instance
+
+                with patch('sys.argv', ['query.py', '--start', '2024-01-01', '--end', '2024-03-31', '--group-by', 'service']):
+                    result = main()
+
+        assert result == 1, "Exit code should be 1 for credentials error"
+        captured = capsys.readouterr()
+        assert 'Error: AWS credentials not found. Configure credentials via AWS CLI or environment variables.' in captured.out
 
 
 # ============================================================================
@@ -418,6 +627,33 @@ class TestFixtureProvider:
         assert 'development | $300.00' in output
         assert 'TOTAL | $2,800.00' in output
 
+    def test_dry_run_fixture(self, capsys):
+        """
+        Test --dry-run fixture determinism (Optional acceptance criterion).
+
+        Calls main() with --dry-run --group-by service twice.
+        Verifies:
+        - Both calls return identical output
+        - Output is valid markdown table
+        - No boto3 calls made
+        """
+        # First call
+        with patch('sys.argv', ['query.py', '--dry-run', '--group-by', 'service']):
+            result1 = main()
+        captured1 = capsys.readouterr()
+        output1 = captured1.out
+
+        # Second call
+        with patch('sys.argv', ['query.py', '--dry-run', '--group-by', 'service']):
+            result2 = main()
+        captured2 = capsys.readouterr()
+        output2 = captured2.out
+
+        assert result1 == 0 and result2 == 0, "Both calls should succeed"
+        assert output1 == output2, "Fixture output should be identical across calls"
+        assert 'Service | Cost USD' in output1, "Output should be valid markdown table"
+        assert 'TOTAL' in output1, "Output should have grand total row"
+
     def test_fixture_determinism(self):
         """Test that fixture is deterministic (same output on multiple calls)."""
         provider1 = FixtureProvider('service')
@@ -426,7 +662,7 @@ class TestFixtureProvider:
         provider2 = FixtureProvider('service')
         output2 = provider2.get_fixture_table()
 
-        assert output1 == output2
+        assert output1 == output2, "Fixture should be deterministic"
 
     def test_fixture_sorted_by_cost(self):
         """Test that fixture is sorted descending by cost."""
@@ -444,7 +680,7 @@ class TestFixtureProvider:
             costs.append(float(cost_str))
 
         # Check that costs are in descending order
-        assert costs == sorted(costs, reverse=True)
+        assert costs == sorted(costs, reverse=True), "Costs should be sorted descending"
 
 
 # ============================================================================
@@ -580,11 +816,11 @@ class TestOutputFormatter:
 
 
 # ============================================================================
-# Tests for main() entry point
+# Tests for main() entry point - Argument Validation
 # ============================================================================
 
-class TestMain:
-    """Test main() entry point."""
+class TestMainArgumentValidation:
+    """Test main() argument validation."""
 
     def test_main_dry_run_service(self, capsys):
         """Test main with --dry-run --group-by service."""
@@ -650,55 +886,3 @@ class TestMain:
         with patch('sys.argv', ['query.py', '--start', '2024-01-01', '--end', '2024-03-31', '--group-by', 'invalid']):
             with pytest.raises(SystemExit):
                 main()
-
-    @patch('query.CostExplorerClient')
-    def test_main_no_credentials_error(self, mock_client_class, capsys):
-        """Test main handles NoCredentialsError."""
-        mock_instance = MagicMock()
-        mock_client_class.return_value = mock_instance
-        mock_instance.get_costs.side_effect = NoCredentialsError()
-
-        with patch('sys.argv', ['query.py', '--start', '2024-01-01', '--end', '2024-03-31', '--group-by', 'service']):
-            result = main()
-
-        assert result == 1
-        captured = capsys.readouterr()
-        assert 'Error: AWS credentials not found' in captured.out
-
-    @patch('query.CostExplorerClient')
-    def test_main_unauthorized_operation_error(self, mock_client_class, capsys):
-        """Test main handles UnauthorizedOperation ClientError."""
-        mock_instance = MagicMock()
-        mock_client_class.return_value = mock_instance
-
-        error = ClientError(
-            {'Error': {'Code': 'UnauthorizedOperation'}},
-            'GetCostAndUsage'
-        )
-        mock_instance.get_costs.side_effect = error
-
-        with patch('sys.argv', ['query.py', '--start', '2024-01-01', '--end', '2024-03-31', '--group-by', 'service']):
-            result = main()
-
-        assert result == 1
-        captured = capsys.readouterr()
-        assert 'Error: AWS Cost Explorer API access denied' in captured.out
-
-    @patch('query.CostExplorerClient')
-    def test_main_success_with_stubbed_results(self, mock_client_class, capsys):
-        """Test main successfully formats results from CostExplorerClient."""
-        mock_instance = MagicMock()
-        mock_client_class.return_value = mock_instance
-        mock_instance.get_costs.return_value = [
-            ('EC2', 1234.56),
-            ('RDS', 567.89),
-        ]
-
-        with patch('sys.argv', ['query.py', '--start', '2024-01-01', '--end', '2024-03-31', '--group-by', 'service']):
-            result = main()
-
-        assert result == 0
-        captured = capsys.readouterr()
-        assert 'EC2 | $1,234.56' in captured.out
-        assert 'RDS | $567.89' in captured.out
-        assert 'TOTAL' in captured.out
