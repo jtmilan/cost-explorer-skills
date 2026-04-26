@@ -141,6 +141,66 @@ The skill provides clear error messages for common issues:
 
 - **Invalid Arguments**: If CLI arguments are malformed (e.g., invalid date format), argparse prints usage and exits with code 2.
 
+## cost-anomaly-investigate Skill
+
+The cost-anomaly-investigate skill investigates the root causes of AWS cost spikes. Given a date and service, it queries Phase 1's cost data to confirm elevated costs, then gathers CloudWatch metrics and CloudTrail events to identify likely causes.
+
+### Usage
+
+```bash
+python skills/cost-anomaly-investigate/investigate.py --date YYYY-MM-DD --service <service> [--dry-run]
+```
+
+**Arguments:**
+- `--date YYYY-MM-DD` (required): Date to investigate in YYYY-MM-DD format (e.g., 2024-03-15)
+- `--service <service>` (required): AWS service name (e.g., EC2, RDS, Lambda, S3, DynamoDB, etc.)
+- `--dry-run` (optional): Use fixture data instead of querying AWS (for testing without credentials)
+
+### Example: Investigate EC2 Cost Spike (Dry-Run)
+
+```bash
+python skills/cost-anomaly-investigate/investigate.py --date 2024-03-15 --service EC2 --dry-run
+```
+
+**Expected Output:**
+
+```markdown
+# Cost Spike: $5,234.56 on 2024-03-15 (EC2)
+
+## Spike Summary
+Baseline (previous month average): $1,200.00/day
+Spike cost (2024-03-15): $6,434.56/day
+Delta: $5,234.56 (435.3% increase)
+
+## Likely Causes
+1. EC2 instance launch surge: 15 instances launched on 2024-03-15
+2. Data transfer spike: NetworkOut exceeded 100 Mbps
+3. Configuration or deployment activity: 25 mutating events detected
+
+## Evidence
+
+### CloudTrail Events
+| Timestamp | Principal | Action | Resources |
+|-----------|-----------|--------|-----------|
+| 2024-03-15T10:30:45Z | arn:aws:iam::123456789012:user/alice | RunInstances | i-1234567890abcdef0 |
+| 2024-03-15T10:45:20Z | arn:aws:iam::123456789012:role/lambda-role | RunInstances | i-0987654321fedcba0 |
+
+### Metrics
+CPUUtilization: 45.2% average, max 89.5%
+NetworkIn: 1.2 GB total
+NetworkOut: 2.5 GB total
+
+---
+Investigation completed at 2024-03-15T14:30:00Z
+```
+
+### Error Handling
+
+- **Invalid date format**: Exit code 2; error message about date format
+- **Unknown service**: Exit code 2; error message with list of valid services
+- **Missing credentials**: Exit code 1; error message about AWS credentials
+- **AWS API error**: Exit code 1; error message about API failure
+
 ## Project Structure
 
 ```
@@ -150,11 +210,15 @@ The skill provides clear error messages for common issues:
 ├── pyproject.toml                     # Project metadata and dependencies
 ├── install.sh                         # Installation script
 ├── skills/
-│   └── cost-explorer-query/
+│   ├── cost-explorer-query/
+│   │   ├── SKILL.md                   # Skill metadata
+│   │   └── query.py                   # Main CLI implementation
+│   └── cost-anomaly-investigate/
 │       ├── SKILL.md                   # Skill metadata
-│       └── query.py                   # Main CLI implementation
+│       └── investigate.py             # Main CLI implementation
 └── tests/
-    └── test_query.py                  # Pytest test suite
+    ├── test_query.py                  # Pytest test suite for query
+    └── test_investigate.py            # Pytest test suite for investigate
 ```
 
 ## License
