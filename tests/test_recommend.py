@@ -42,6 +42,7 @@ CPU_THRESHOLD = recommend_module.CPU_THRESHOLD
 LOOKBACK_DAYS = recommend_module.LOOKBACK_DAYS
 INSTANCE_PRICING = recommend_module.INSTANCE_PRICING
 OversizedRdsRule = recommend_module.OversizedRdsRule
+OrphanEbsRule = recommend_module.OrphanEbsRule
 
 
 # ============================================================================
@@ -1660,3 +1661,360 @@ class TestOversizedRdsRule:
         """Test that OversizedRdsRule extends BaseRule."""
         BaseRule = recommend_module.BaseRule
         assert issubclass(OversizedRdsRule, BaseRule)
+
+# ============================================================================
+# Tests for OrphanEbsRule
+# ============================================================================
+
+class TestOrphanEbsRule:
+    """Tests for OrphanEbsRule using botocore.stub.Stubber."""
+
+    def test_orphan_ebs_rule_id(self):
+        """Test OrphanEbsRule has correct rule_id."""
+        rule = OrphanEbsRule()
+        assert rule.rule_id == "orphan-ebs"
+
+    def test_orphan_ebs_extends_base_rule(self):
+        """Test OrphanEbsRule extends BaseRule."""
+        rule = OrphanEbsRule()
+        assert isinstance(rule, BaseRule)
+
+    def test_orphan_ebs_age_threshold(self):
+        """Test AGE_THRESHOLD_DAYS is 14."""
+        assert OrphanEbsRule.AGE_THRESHOLD_DAYS == 14
+
+    def test_orphan_ebs_pricing_dict(self):
+        """Test EBS_PRICING dict has required volume types."""
+        expected_types = {'gp2', 'gp3', 'io1', 'io2', 'st1', 'sc1', 'standard'}
+        assert set(OrphanEbsRule.EBS_PRICING.keys()) == expected_types
+
+    def test_orphan_ebs_detects_old_unattached_volume(self):
+        """Test rule detects volume unattached >14 days."""
+        rule = OrphanEbsRule()
+
+        ec2_client = boto3.client('ec2', region_name='us-east-1')
+        stubber = Stubber(ec2_client)
+
+        # Volume created 21 days ago
+        create_time = datetime.now(timezone.utc) - timedelta(days=21)
+
+        stubber.add_response(
+            'describe_volumes',
+            {
+                'Volumes': [{
+                    'VolumeId': 'vol-12345678',
+                    'VolumeType': 'gp2',
+                    'Size': 100,
+                    'State': 'available',
+                    'CreateTime': create_time,
+                    'AvailabilityZone': 'us-east-1a',
+                    'Attachments': []
+                }]
+            },
+            expected_params={
+                'Filters': [{'Name': 'status', 'Values': ['available']}]
+            }
+        )
+
+        stubber.activate()
+        rule._ec2_client = ec2_client
+        result = rule.execute()
+        stubber.deactivate()
+
+        assert result.rule_id == "orphan-ebs"
+        assert result.error is None
+        assert len(result.findings) == 1
+        assert "vol-12345678" in result.findings[0].arn
+        assert result.findings[0].arn.startswith("arn:aws:ec2:")
+        assert "volume/vol-12345678" in result.findings[0].arn
+        assert "21 days" in result.findings[0].finding
+        assert result.findings[0].fix_command == "aws ec2 delete-volume --volume-id vol-12345678"
+
+    def test_orphan_ebs_ignores_recent_volume(self):
+        """Test rule ignores volume unattached <14 days (7 days old)."""
+        rule = OrphanEbsRule()
+
+        ec2_client = boto3.client('ec2', region_name='us-east-1')
+        stubber = Stubber(ec2_client)
+
+        # Volume created 7 days ago (should NOT be flagged)
+        create_time = datetime.now(timezone.utc) - timedelta(days=7)
+
+        stubber.add_response(
+            'describe_volumes',
+            {
+                'Volumes': [{
+                    'VolumeId': 'vol-recent',
+                    'VolumeType': 'gp3',
+                    'Size': 50,
+                    'State': 'available',
+                    'CreateTime': create_time,
+                    'AvailabilityZone': 'us-east-1a',
+                    'Attachments': []
+                }]
+            },
+            expected_params={
+                'Filters': [{'Name': 'status', 'Values': ['available']}]
+            }
+        )
+
+        stubber.activate()
+        rule._ec2_client = ec2_client
+        result = rule.execute()
+        stubber.deactivate()
+
+        assert result.rule_id == "orphan-ebs"
+        assert result.error is None
+        assert len(result.findings) == 0  # Should not find the recent volume
+
+    def test_orphan_ebs_savings_calculation(self):
+        """Test savings calculation uses volume size * pricing."""
+        rule = OrphanEbsRule()
+
+        ec2_client = boto3.client('ec2', region_name='us-east-1')
+        stubber = Stubber(ec2_client)
+
+        # Volume: 100 GB gp2 ($0.10/GB-month) = $10.00/month
+        create_time = datetime.now(timezone.utc) - timedelta(days=21)
+
+        stubber.add_response(
+            'describe_volumes',
+            {
+                'Volumes': [{
+                    'VolumeId': 'vol-savings-test',
+                    'VolumeType': 'gp2',
+                    'Size': 100,
+                    'State': 'available',
+                    'CreateTime': create_time,
+                    'AvailabilityZone': 'us-east-1a',
+                    'Attachments': []
+                }]
+            },
+            expected_params={
+                'Filters': [{'Name': 'status', 'Values': ['available']}]
+            }
+        )
+
+        stubber.activate()
+        rule._ec2_client = ec2_client
+        result = rule.execute()
+        stubber.deactivate()
+
+        assert result.error is None
+        assert len(result.findings) == 1
+        # 100 GB * $0.10/GB = $10.00
+        assert result.findings[0].est_monthly_saved_usd == 10.0
+
+    def test_orphan_ebs_savings_gp3_pricing(self):
+        """Test savings calculation for gp3 volume type."""
+        rule = OrphanEbsRule()
+
+        ec2_client = boto3.client('ec2', region_name='us-east-1')
+        stubber = Stubber(ec2_client)
+
+        # Volume: 200 GB gp3 ($0.08/GB-month) = $16.00/month
+        create_time = datetime.now(timezone.utc) - timedelta(days=21)
+
+        stubber.add_response(
+            'describe_volumes',
+            {
+                'Volumes': [{
+                    'VolumeId': 'vol-gp3-test',
+                    'VolumeType': 'gp3',
+                    'Size': 200,
+                    'State': 'available',
+                    'CreateTime': create_time,
+                    'AvailabilityZone': 'us-west-2a',
+                    'Attachments': []
+                }]
+            },
+            expected_params={
+                'Filters': [{'Name': 'status', 'Values': ['available']}]
+            }
+        )
+
+        stubber.activate()
+        rule._ec2_client = ec2_client
+        result = rule.execute()
+        stubber.deactivate()
+
+        assert result.error is None
+        assert len(result.findings) == 1
+        # 200 GB * $0.08/GB = $16.00
+        assert result.findings[0].est_monthly_saved_usd == 16.0
+
+    def test_orphan_ebs_error_handling_client_error(self):
+        """Test error handling for ClientError."""
+        rule = OrphanEbsRule()
+
+        ec2_client = boto3.client('ec2', region_name='us-east-1')
+        stubber = Stubber(ec2_client)
+
+        stubber.add_client_error(
+            'describe_volumes',
+            service_error_code='AccessDeniedException',
+            service_message='User is not authorized'
+        )
+
+        stubber.activate()
+        rule._ec2_client = ec2_client
+        result = rule.execute()
+        stubber.deactivate()
+
+        assert result.rule_id == "orphan-ebs"
+        assert result.error is not None
+        assert "AccessDeniedException" in result.error
+        assert len(result.findings) == 0
+
+    def test_orphan_ebs_no_volumes(self):
+        """Test rule handles no available volumes."""
+        rule = OrphanEbsRule()
+
+        ec2_client = boto3.client('ec2', region_name='us-east-1')
+        stubber = Stubber(ec2_client)
+
+        stubber.add_response(
+            'describe_volumes',
+            {
+                'Volumes': []
+            },
+            expected_params={
+                'Filters': [{'Name': 'status', 'Values': ['available']}]
+            }
+        )
+
+        stubber.activate()
+        rule._ec2_client = ec2_client
+        result = rule.execute()
+        stubber.deactivate()
+
+        assert result.rule_id == "orphan-ebs"
+        assert result.error is None
+        assert len(result.findings) == 0
+
+    def test_orphan_ebs_arn_format(self):
+        """Test ARN format is arn:aws:ec2:region:account:volume/vol-xxx."""
+        rule = OrphanEbsRule()
+
+        ec2_client = boto3.client('ec2', region_name='us-east-1')
+        stubber = Stubber(ec2_client)
+
+        create_time = datetime.now(timezone.utc) - timedelta(days=21)
+
+        stubber.add_response(
+            'describe_volumes',
+            {
+                'Volumes': [{
+                    'VolumeId': 'vol-arn-test',
+                    'VolumeType': 'gp2',
+                    'Size': 50,
+                    'State': 'available',
+                    'CreateTime': create_time,
+                    'AvailabilityZone': 'eu-west-1a',
+                    'Attachments': []
+                }]
+            },
+            expected_params={
+                'Filters': [{'Name': 'status', 'Values': ['available']}]
+            }
+        )
+
+        stubber.activate()
+        rule._ec2_client = ec2_client
+        result = rule.execute()
+        stubber.deactivate()
+
+        assert result.error is None
+        assert len(result.findings) == 1
+        arn = result.findings[0].arn
+        # Verify ARN format
+        assert arn.startswith("arn:aws:ec2:")
+        assert ":volume/vol-arn-test" in arn
+        # Should include region (eu-west-1 from eu-west-1a)
+        assert "eu-west-1" in arn
+
+    def test_orphan_ebs_fix_command_format(self):
+        """Test fix_command format is 'aws ec2 delete-volume --volume-id {vol_id}'."""
+        rule = OrphanEbsRule()
+
+        ec2_client = boto3.client('ec2', region_name='us-east-1')
+        stubber = Stubber(ec2_client)
+
+        create_time = datetime.now(timezone.utc) - timedelta(days=21)
+
+        stubber.add_response(
+            'describe_volumes',
+            {
+                'Volumes': [{
+                    'VolumeId': 'vol-fix-cmd-test',
+                    'VolumeType': 'gp2',
+                    'Size': 50,
+                    'State': 'available',
+                    'CreateTime': create_time,
+                    'AvailabilityZone': 'us-east-1a',
+                    'Attachments': []
+                }]
+            },
+            expected_params={
+                'Filters': [{'Name': 'status', 'Values': ['available']}]
+            }
+        )
+
+        stubber.activate()
+        rule._ec2_client = ec2_client
+        result = rule.execute()
+        stubber.deactivate()
+
+        assert result.error is None
+        assert len(result.findings) == 1
+        fix_cmd = result.findings[0].fix_command
+        assert fix_cmd == "aws ec2 delete-volume --volume-id vol-fix-cmd-test"
+
+    def test_orphan_ebs_multiple_volumes_mixed_ages(self):
+        """Test rule only flags volumes older than 14 days when mixed ages present."""
+        rule = OrphanEbsRule()
+
+        ec2_client = boto3.client('ec2', region_name='us-east-1')
+        stubber = Stubber(ec2_client)
+
+        old_create_time = datetime.now(timezone.utc) - timedelta(days=21)
+        recent_create_time = datetime.now(timezone.utc) - timedelta(days=7)
+
+        stubber.add_response(
+            'describe_volumes',
+            {
+                'Volumes': [
+                    {
+                        'VolumeId': 'vol-old',
+                        'VolumeType': 'gp2',
+                        'Size': 100,
+                        'State': 'available',
+                        'CreateTime': old_create_time,
+                        'AvailabilityZone': 'us-east-1a',
+                        'Attachments': []
+                    },
+                    {
+                        'VolumeId': 'vol-recent',
+                        'VolumeType': 'gp2',
+                        'Size': 100,
+                        'State': 'available',
+                        'CreateTime': recent_create_time,
+                        'AvailabilityZone': 'us-east-1a',
+                        'Attachments': []
+                    }
+                ]
+            },
+            expected_params={
+                'Filters': [{'Name': 'status', 'Values': ['available']}]
+            }
+        )
+
+        stubber.activate()
+        rule._ec2_client = ec2_client
+        result = rule.execute()
+        stubber.deactivate()
+
+        assert result.error is None
+        # Should only find the old volume
+        assert len(result.findings) == 1
+        assert "vol-old" in result.findings[0].arn
