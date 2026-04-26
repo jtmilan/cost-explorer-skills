@@ -17,6 +17,7 @@ import argparse
 from datetime import datetime, timezone
 from typing import List, Dict
 import importlib.util
+import boto3
 
 
 # Load the investigate module directly from file
@@ -778,3 +779,418 @@ class TestGetPreviousMonthRange:
 
         assert start == datetime(2024, 11, 1, 0, 0, 0, tzinfo=timezone.utc)
         assert end == datetime(2024, 12, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+
+# ============================================================================
+# Tests for CostAnomalyInvestigator Class
+# ============================================================================
+
+class TestCostAnomalyInvestigatorDetectSpike:
+    """Test CostAnomalyInvestigator.detect_spike() method."""
+
+    def test_detect_spike_with_baseline(self):
+        """Test detect_spike with previous month data (baseline available)."""
+        from unittest.mock import Mock, patch
+
+        # Create a mock module with CostExplorerClient
+        mock_ce = Mock()
+        # Use consistent values: Feb 2024 has 29 days, so 29000 / 29 = 1000
+        mock_ce.get_costs.side_effect = [
+            [('EC2', 29000.0), ('RDS', 10000.0)],  # Previous month (29 days in Feb 2024)
+            [('EC2', 5000.0), ('RDS', 2000.0)]     # Spike date
+        ]
+
+        mock_module = Mock()
+        mock_module.CostExplorerClient = Mock(return_value=mock_ce)
+
+        # Patch importlib.import_module to return our mock module
+        with patch('importlib.import_module', return_value=mock_module):
+            investigator = investigate_module.CostAnomalyInvestigator('2024-03-15', 'EC2')
+            result = investigator.detect_spike()
+
+            # Verify result
+            assert isinstance(result, investigate_module.SpikeSummary)
+            assert result.date == '2024-03-15'
+            assert result.service == 'EC2'
+            assert result.baseline_cost == 1000.0  # 29000 / 29 days
+            assert result.spike_cost == 5000.0
+            assert result.delta == 4000.0
+            assert result.delta_percent == 400.0  # 4000 / 1000 * 100
+
+    def test_detect_spike_zero_baseline(self):
+        """Test detect_spike with zero baseline (previous month unavailable)."""
+        from unittest.mock import Mock, patch
+
+        # Create a mock module with CostExplorerClient
+        mock_ce = Mock()
+        mock_ce.get_costs.side_effect = [
+            [('RDS', 10000.0)],              # Previous month (no EC2)
+            [('EC2', 5000.0), ('RDS', 2000.0)]  # Spike date
+        ]
+
+        mock_module = Mock()
+        mock_module.CostExplorerClient = Mock(return_value=mock_ce)
+
+        with patch('importlib.import_module', return_value=mock_module):
+            investigator = investigate_module.CostAnomalyInvestigator('2024-03-15', 'EC2')
+            result = investigator.detect_spike()
+
+            # Verify result
+            assert result.baseline_cost == 0.0
+            assert result.spike_cost == 5000.0
+            assert result.delta == 5000.0
+            assert result.delta_percent == 0.0  # Undefined ratio when baseline=0
+
+
+class TestCostAnomalyInvestigatorCloudWatchMetrics:
+    """Test CostAnomalyInvestigator.get_cloudwatch_metrics() method."""
+
+    def test_get_cloudwatch_metrics_retrieval(self):
+        """Test get_cloudwatch_metrics fetches and returns metrics."""
+        from unittest.mock import Mock, patch
+        from botocore.stub import Stubber
+
+        investigator = investigate_module.CostAnomalyInvestigator('2024-03-15', 'EC2')
+
+        # Create stubbed CloudWatch client
+        cw_client = boto3.client('cloudwatch', region_name='us-east-1')
+        stubber = Stubber(cw_client)
+
+        # Mock response for CPUUtilization
+        stubber.add_response(
+            'get_metric_statistics',
+            {
+                'Datapoints': [
+                    {
+                        'Timestamp': datetime(2024, 3, 15, 10, 0, 0, tzinfo=timezone.utc),
+                        'Average': 45.2,
+                        'Unit': 'Percent'
+                    },
+                    {
+                        'Timestamp': datetime(2024, 3, 15, 11, 0, 0, tzinfo=timezone.utc),
+                        'Average': 55.5,
+                        'Unit': 'Percent'
+                    }
+                ]
+            },
+            expected_params={
+                'Namespace': 'AWS/EC2',
+                'MetricName': 'CPUUtilization',
+                'StartTime': datetime(2024, 3, 15, 0, 0, 0, tzinfo=timezone.utc),
+                'EndTime': datetime(2024, 3, 15, 23, 59, 59, tzinfo=timezone.utc),
+                'Period': 60,
+                'Statistics': ['Average', 'Sum', 'Maximum']
+            }
+        )
+
+        # Mock response for NetworkIn (empty)
+        stubber.add_response(
+            'get_metric_statistics',
+            {'Datapoints': []},
+            expected_params={
+                'Namespace': 'AWS/EC2',
+                'MetricName': 'NetworkIn',
+                'StartTime': datetime(2024, 3, 15, 0, 0, 0, tzinfo=timezone.utc),
+                'EndTime': datetime(2024, 3, 15, 23, 59, 59, tzinfo=timezone.utc),
+                'Period': 60,
+                'Statistics': ['Average', 'Sum', 'Maximum']
+            }
+        )
+
+        # Mock response for NetworkOut (empty)
+        stubber.add_response(
+            'get_metric_statistics',
+            {'Datapoints': []},
+            expected_params={
+                'Namespace': 'AWS/EC2',
+                'MetricName': 'NetworkOut',
+                'StartTime': datetime(2024, 3, 15, 0, 0, 0, tzinfo=timezone.utc),
+                'EndTime': datetime(2024, 3, 15, 23, 59, 59, tzinfo=timezone.utc),
+                'Period': 60,
+                'Statistics': ['Average', 'Sum', 'Maximum']
+            }
+        )
+
+        with stubber:
+            investigator._cloudwatch = cw_client
+            result = investigator.get_cloudwatch_metrics()
+
+        # Verify result
+        assert isinstance(result, dict)
+        assert 'CPUUtilization' in result
+        assert len(result['CPUUtilization']) == 2
+        assert result['CPUUtilization'][0].value == 45.2
+        assert result['CPUUtilization'][0].unit == 'Percent'
+        assert result['CPUUtilization'][0].statistic == 'Average'
+        # NetworkIn and NetworkOut should be omitted (empty)
+        assert 'NetworkIn' not in result
+        assert 'NetworkOut' not in result
+
+
+class TestCostAnomalyInvestigatorCloudTrailEvents:
+    """Test CostAnomalyInvestigator.get_cloudtrail_events() method."""
+
+    def test_cloudtrail_event_filtering(self):
+        """Test get_cloudtrail_events filters to mutating verbs only."""
+        from botocore.stub import Stubber
+
+        investigator = investigate_module.CostAnomalyInvestigator('2024-03-15', 'EC2')
+
+        # Create stubbed CloudTrail client
+        ct_client = boto3.client('cloudtrail', region_name='us-east-1')
+        stubber = Stubber(ct_client)
+
+        # Mock response with mixed mutating and read-only events
+        # Note: CloudTrail API uses different field names than our CloudTrailEvent dataclass
+        stubber.add_response(
+            'lookup_events',
+            {
+                'Events': [
+                    {
+                        'EventTime': datetime(2024, 3, 15, 10, 30, 45, tzinfo=timezone.utc),
+                        'Username': 'arn:aws:iam::123456789012:user/alice',
+                        'EventName': 'CreateInstance',  # Mutating, matches Create.*
+                        'Resources': [
+                            {'ResourceName': 'i-1234567890abcdef0', 'ResourceType': 'AWS::EC2::Instance'}
+                        ]
+                    },
+                    {
+                        'EventTime': datetime(2024, 3, 15, 10, 45, 20, tzinfo=timezone.utc),
+                        'Username': 'arn:aws:iam::123456789012:role/lambda-role',
+                        'EventName': 'DescribeInstances',  # Read-only, should be filtered out
+                        'Resources': []
+                    },
+                    {
+                        'EventTime': datetime(2024, 3, 15, 11, 0, 0, tzinfo=timezone.utc),
+                        'Username': 'arn:aws:iam::123456789012:user/bob',
+                        'EventName': 'ModifyInstanceAttribute',  # Mutating, matches Modify.*
+                        'Resources': [
+                            {'ResourceName': 'i-0987654321fedcba0', 'ResourceType': 'AWS::EC2::Instance'}
+                        ]
+                    }
+                ]
+            },
+            expected_params={
+                'LookupAttributes': [
+                    {
+                        'AttributeKey': 'ResourceType',
+                        'AttributeValue': 'AWS::EC2::Instance'
+                    }
+                ],
+                'StartTime': datetime(2024, 3, 15, 0, 0, 0, tzinfo=timezone.utc),
+                'EndTime': datetime(2024, 3, 15, 23, 59, 59, tzinfo=timezone.utc),
+                'MaxResults': 50
+            }
+        )
+
+        with stubber:
+            investigator._cloudtrail = ct_client
+            result = investigator.get_cloudtrail_events()
+
+        # Verify result
+        assert isinstance(result, list)
+        assert len(result) == 2  # Only 2 mutating events, DescribeInstances filtered out
+        assert result[0].action == 'CreateInstance'
+        assert result[1].action == 'ModifyInstanceAttribute'
+        # Verify resource names are captured (from ResourceName field)
+        assert len(result[0].resource) > 0
+        # Verify sorted by timestamp
+        assert result[0].timestamp < result[1].timestamp
+
+
+class TestCostAnomalyInvestigatorDeriveCauses:
+    """Test CostAnomalyInvestigator._derive_causes() method."""
+
+    def test_derive_causes_instance_launch_surge(self):
+        """Test _derive_causes detects EC2 instance launch surge."""
+        spike = investigate_module.SpikeSummary(
+            date='2024-03-15',
+            service='EC2',
+            baseline_cost=1000.0,
+            spike_cost=5000.0,
+            delta=4000.0,
+            delta_percent=400.0
+        )
+
+        # Create 15 RunInstances events
+        events = [
+            investigate_module.CloudTrailEvent(
+                timestamp=datetime(2024, 3, 15, 10, i, 0, tzinfo=timezone.utc),
+                principal='arn:aws:iam::123456789012:user/alice',
+                action='RunInstances',
+                resource=[f'arn:aws:ec2:us-east-1:123456789012:instance/i-{i:016d}'],
+                source_ip='192.0.2.1'
+            )
+            for i in range(15)
+        ]
+
+        investigator = investigate_module.CostAnomalyInvestigator('2024-03-15', 'EC2')
+        causes = investigator._derive_causes(spike, {}, events)
+
+        # Verify
+        assert len(causes) >= 1
+        assert causes[0].title == "EC2 instance launch surge"
+        assert '15' in causes[0].description
+
+    def test_derive_causes_high_mutation_rate(self):
+        """Test _derive_causes detects high mutation rate."""
+        spike = investigate_module.SpikeSummary(
+            date='2024-03-15',
+            service='EC2',
+            baseline_cost=1000.0,
+            spike_cost=3000.0,
+            delta=2000.0,
+            delta_percent=200.0
+        )
+
+        # Create 25 mutating events (below launch surge threshold but above high mutation threshold)
+        events = [
+            investigate_module.CloudTrailEvent(
+                timestamp=datetime(2024, 3, 15, 10, i % 60, 0, tzinfo=timezone.utc),
+                principal='arn:aws:iam::123456789012:user/alice',
+                action='ModifyInstanceAttribute' if i % 2 == 0 else 'CreateSecurityGroup',
+                resource=['arn:aws:ec2:us-east-1:123456789012:instance/i-123'],
+                source_ip='192.0.2.1'
+            )
+            for i in range(25)
+        ]
+
+        investigator = investigate_module.CostAnomalyInvestigator('2024-03-15', 'EC2')
+        causes = investigator._derive_causes(spike, {}, events)
+
+        # Verify
+        assert len(causes) >= 1
+        assert any('mutating events' in c.description for c in causes)
+
+    def test_derive_causes_fallback(self):
+        """Test _derive_causes returns fallback when no rules match."""
+        spike = investigate_module.SpikeSummary(
+            date='2024-03-15',
+            service='EC2',
+            baseline_cost=1000.0,
+            spike_cost=1100.0,
+            delta=100.0,
+            delta_percent=10.0
+        )
+
+        # No events, no metrics
+        investigator = investigate_module.CostAnomalyInvestigator('2024-03-15', 'EC2')
+        causes = investigator._derive_causes(spike, {}, [])
+
+        # Verify fallback is always present
+        assert len(causes) >= 1
+        assert causes[0].title == "Unable to determine root cause"
+
+    def test_derive_causes_returns_1_to_3_causes(self):
+        """Test _derive_causes always returns 1-3 causes (never empty)."""
+        spike = investigate_module.SpikeSummary(
+            date='2024-03-15',
+            service='EC2',
+            baseline_cost=1000.0,
+            spike_cost=2000.0,
+            delta=1000.0,
+            delta_percent=100.0
+        )
+
+        investigator = investigate_module.CostAnomalyInvestigator('2024-03-15', 'EC2')
+
+        # Test with various event counts
+        for event_count in [0, 1, 5, 10, 25, 50]:
+            events = [
+                investigate_module.CloudTrailEvent(
+                    timestamp=datetime(2024, 3, 15, 10, 0, 0, tzinfo=timezone.utc),
+                    principal='arn:aws:iam::123456789012:user/alice',
+                    action='RunInstances',
+                    resource=['arn:aws:ec2:us-east-1:123456789012:instance/i-123'],
+                    source_ip='192.0.2.1'
+                )
+                for _ in range(event_count)
+            ]
+
+            causes = investigator._derive_causes(spike, {}, events)
+
+            # Never empty, max 3
+            assert 1 <= len(causes) <= 3
+            # All ranks are 1-3
+            for i, cause in enumerate(causes, start=1):
+                assert cause.rank == i
+
+
+class TestCostAnomalyInvestigatorOrchestration:
+    """Test CostAnomalyInvestigator.investigate() orchestration method."""
+
+    def test_investigate_orchestration(self):
+        """Test investigate() calls all methods and returns InvestigationReport."""
+        from unittest.mock import Mock, patch
+        from botocore.stub import Stubber
+
+        # Create a mock module with CostExplorerClient
+        mock_ce = Mock()
+        mock_ce.get_costs.side_effect = [
+            [('EC2', 30000.0)],
+            [('EC2', 5000.0)]
+        ]
+
+        mock_module = Mock()
+        mock_module.CostExplorerClient = Mock(return_value=mock_ce)
+
+        with patch('importlib.import_module', return_value=mock_module):
+            # Mock CloudWatch
+            cw_client = boto3.client('cloudwatch', region_name='us-east-1')
+            cw_stubber = Stubber(cw_client)
+
+            # Mock CloudTrail
+            ct_client = boto3.client('cloudtrail', region_name='us-east-1')
+            ct_stubber = Stubber(ct_client)
+
+            # Setup CloudWatch stubs for 3 metrics
+            for metric_name in ['CPUUtilization', 'NetworkIn', 'NetworkOut']:
+                cw_stubber.add_response(
+                    'get_metric_statistics',
+                    {'Datapoints': []},
+                    expected_params={
+                        'Namespace': 'AWS/EC2',
+                        'MetricName': metric_name,
+                        'StartTime': datetime(2024, 3, 15, 0, 0, 0, tzinfo=timezone.utc),
+                        'EndTime': datetime(2024, 3, 15, 23, 59, 59, tzinfo=timezone.utc),
+                        'Period': 60,
+                        'Statistics': ['Average', 'Sum', 'Maximum']
+                    }
+                )
+
+            # Setup CloudTrail stub
+            ct_stubber.add_response(
+                'lookup_events',
+                {'Events': []},
+                expected_params={
+                    'LookupAttributes': [
+                        {
+                            'AttributeKey': 'ResourceType',
+                            'AttributeValue': 'AWS::EC2::Instance'
+                        }
+                    ],
+                    'StartTime': datetime(2024, 3, 15, 0, 0, 0, tzinfo=timezone.utc),
+                    'EndTime': datetime(2024, 3, 15, 23, 59, 59, tzinfo=timezone.utc),
+                    'MaxResults': 50
+                }
+            )
+
+            with cw_stubber, ct_stubber:
+                investigator = investigate_module.CostAnomalyInvestigator('2024-03-15', 'EC2')
+                investigator._cloudwatch = cw_client
+                investigator._cloudtrail = ct_client
+
+                result = investigator.investigate()
+
+                # Verify result
+                assert isinstance(result, investigate_module.InvestigationReport)
+                assert isinstance(result.spike, investigate_module.SpikeSummary)
+                assert isinstance(result.metrics, dict)
+                assert isinstance(result.events, list)
+                assert isinstance(result.likely_causes, list)
+                assert isinstance(result.investigation_date, datetime)
+                # Must have 1-3 causes
+                assert 1 <= len(result.likely_causes) <= 3
+                # Spike data should be set
+                assert result.spike.date == '2024-03-15'
+                assert result.spike.service == 'EC2'
