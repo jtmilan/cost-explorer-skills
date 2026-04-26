@@ -468,3 +468,659 @@ class TestNoAWSCalls:
         # Verify we can get filtered results (no AWS dependencies)
         results = FixtureProvider.get_fixture_results_for_rules(["idle-ec2"])
         assert len(results) == 1, "Should return filtered results without any AWS calls"
+
+
+# ============================================================================
+# Tests for BaseRule Abstract Class
+# ============================================================================
+
+class TestBaseRule:
+    """Test BaseRule abstract class."""
+
+    def test_base_rule_cannot_be_instantiated(self):
+        """Test BaseRule cannot be instantiated directly."""
+        BaseRule = recommend_module.BaseRule
+        with pytest.raises(TypeError):
+            BaseRule()
+
+    def test_base_rule_requires_rule_id(self):
+        """Test BaseRule requires rule_id property implementation."""
+        BaseRule = recommend_module.BaseRule
+
+        class IncompleteRule(BaseRule):
+            def execute(self):
+                return RuleResult(rule_id="test", findings=[], error=None)
+
+        with pytest.raises(TypeError):
+            IncompleteRule()
+
+    def test_base_rule_requires_execute(self):
+        """Test BaseRule requires execute method implementation."""
+        BaseRule = recommend_module.BaseRule
+
+        class IncompleteRule(BaseRule):
+            @property
+            def rule_id(self):
+                return "test"
+
+        with pytest.raises(TypeError):
+            IncompleteRule()
+
+
+# ============================================================================
+# Tests for UntaggedSpendRule Class
+# ============================================================================
+
+class TestUntaggedSpendRule:
+    """Test UntaggedSpendRule class using botocore.stub.Stubber for Cost Explorer."""
+
+    def test_untagged_spend_rule_id(self):
+        """Test UntaggedSpendRule has correct rule_id."""
+        UntaggedSpendRule = recommend_module.UntaggedSpendRule
+        rule = UntaggedSpendRule()
+        assert rule.rule_id == "untagged-spend"
+
+    def test_untagged_spend_required_tags_constant(self):
+        """Test REQUIRED_TAGS contains 'Environment' and 'CostCenter'."""
+        UntaggedSpendRule = recommend_module.UntaggedSpendRule
+        assert "Environment" in UntaggedSpendRule.REQUIRED_TAGS
+        assert "CostCenter" in UntaggedSpendRule.REQUIRED_TAGS
+
+    def test_untagged_spend_lookback_days_constant(self):
+        """Test LOOKBACK_DAYS is set to 30."""
+        UntaggedSpendRule = recommend_module.UntaggedSpendRule
+        assert UntaggedSpendRule.LOOKBACK_DAYS == 30
+
+    def test_untagged_spend_detects_missing_tags(self):
+        """Test rule detects resources without required tags using Stubber."""
+        import boto3
+        from botocore.stub import Stubber
+        from datetime import datetime, timedelta, timezone
+
+        UntaggedSpendRule = recommend_module.UntaggedSpendRule
+        rule = UntaggedSpendRule()
+
+        # Create stubbed Cost Explorer client
+        ce_client = boto3.client('ce', region_name='us-east-1')
+        stubber = Stubber(ce_client)
+
+        # Calculate expected dates
+        end_date = datetime.now(timezone.utc).date()
+        start_date = end_date - timedelta(days=30)
+
+        # Mock response for Environment tag - shows untagged resources
+        stubber.add_response(
+            'get_cost_and_usage',
+            {
+                'ResultsByTime': [{
+                    'TimePeriod': {
+                        'Start': start_date.isoformat(),
+                        'End': end_date.isoformat()
+                    },
+                    'Groups': [
+                        {
+                            'Keys': ['Environment$'],  # Empty tag value
+                            'Metrics': {
+                                'UnblendedCost': {
+                                    'Amount': '150.00',
+                                    'Unit': 'USD'
+                                }
+                            }
+                        },
+                        {
+                            'Keys': ['Environment$production'],
+                            'Metrics': {
+                                'UnblendedCost': {
+                                    'Amount': '500.00',
+                                    'Unit': 'USD'
+                                }
+                            }
+                        }
+                    ],
+                    'Estimated': False
+                }]
+            },
+            expected_params={
+                'TimePeriod': {
+                    'Start': start_date.isoformat(),
+                    'End': end_date.isoformat()
+                },
+                'Granularity': 'MONTHLY',
+                'Metrics': ['UnblendedCost'],
+                'GroupBy': [
+                    {
+                        'Type': 'TAG',
+                        'Key': 'Environment'
+                    }
+                ]
+            }
+        )
+
+        # Mock response for CostCenter tag - shows untagged resources
+        stubber.add_response(
+            'get_cost_and_usage',
+            {
+                'ResultsByTime': [{
+                    'TimePeriod': {
+                        'Start': start_date.isoformat(),
+                        'End': end_date.isoformat()
+                    },
+                    'Groups': [
+                        {
+                            'Keys': ['CostCenter$'],  # Empty tag value
+                            'Metrics': {
+                                'UnblendedCost': {
+                                    'Amount': '200.00',
+                                    'Unit': 'USD'
+                                }
+                            }
+                        },
+                        {
+                            'Keys': ['CostCenter$engineering'],
+                            'Metrics': {
+                                'UnblendedCost': {
+                                    'Amount': '300.00',
+                                    'Unit': 'USD'
+                                }
+                            }
+                        }
+                    ],
+                    'Estimated': False
+                }]
+            },
+            expected_params={
+                'TimePeriod': {
+                    'Start': start_date.isoformat(),
+                    'End': end_date.isoformat()
+                },
+                'Granularity': 'MONTHLY',
+                'Metrics': ['UnblendedCost'],
+                'GroupBy': [
+                    {
+                        'Type': 'TAG',
+                        'Key': 'CostCenter'
+                    }
+                ]
+            }
+        )
+
+        with stubber:
+            rule._ce_client = ce_client
+            result = rule.execute()
+
+        assert result.rule_id == "untagged-spend"
+        assert result.error is None
+        assert len(result.findings) >= 1
+
+    def test_untagged_spend_savings_always_zero(self):
+        """Test est_monthly_saved_usd is 0.00 for all findings."""
+        import boto3
+        from botocore.stub import Stubber
+        from datetime import datetime, timedelta, timezone
+
+        UntaggedSpendRule = recommend_module.UntaggedSpendRule
+        rule = UntaggedSpendRule()
+
+        # Create stubbed Cost Explorer client
+        ce_client = boto3.client('ce', region_name='us-east-1')
+        stubber = Stubber(ce_client)
+
+        end_date = datetime.now(timezone.utc).date()
+        start_date = end_date - timedelta(days=30)
+
+        # Mock response for Environment tag with untagged resources
+        stubber.add_response(
+            'get_cost_and_usage',
+            {
+                'ResultsByTime': [{
+                    'TimePeriod': {
+                        'Start': start_date.isoformat(),
+                        'End': end_date.isoformat()
+                    },
+                    'Groups': [
+                        {
+                            'Keys': ['Environment$'],
+                            'Metrics': {
+                                'UnblendedCost': {
+                                    'Amount': '1000.00',
+                                    'Unit': 'USD'
+                                }
+                            }
+                        }
+                    ],
+                    'Estimated': False
+                }]
+            },
+            expected_params={
+                'TimePeriod': {
+                    'Start': start_date.isoformat(),
+                    'End': end_date.isoformat()
+                },
+                'Granularity': 'MONTHLY',
+                'Metrics': ['UnblendedCost'],
+                'GroupBy': [
+                    {
+                        'Type': 'TAG',
+                        'Key': 'Environment'
+                    }
+                ]
+            }
+        )
+
+        # Mock response for CostCenter tag
+        stubber.add_response(
+            'get_cost_and_usage',
+            {
+                'ResultsByTime': [{
+                    'TimePeriod': {
+                        'Start': start_date.isoformat(),
+                        'End': end_date.isoformat()
+                    },
+                    'Groups': [
+                        {
+                            'Keys': ['CostCenter$'],
+                            'Metrics': {
+                                'UnblendedCost': {
+                                    'Amount': '1000.00',
+                                    'Unit': 'USD'
+                                }
+                            }
+                        }
+                    ],
+                    'Estimated': False
+                }]
+            },
+            expected_params={
+                'TimePeriod': {
+                    'Start': start_date.isoformat(),
+                    'End': end_date.isoformat()
+                },
+                'Granularity': 'MONTHLY',
+                'Metrics': ['UnblendedCost'],
+                'GroupBy': [
+                    {
+                        'Type': 'TAG',
+                        'Key': 'CostCenter'
+                    }
+                ]
+            }
+        )
+
+        with stubber:
+            rule._ce_client = ce_client
+            result = rule.execute()
+
+        # All findings should have $0.00 savings
+        for finding in result.findings:
+            assert finding.est_monthly_saved_usd == 0.00
+
+    def test_untagged_spend_fix_command_format(self):
+        """Test fix_command has correct format."""
+        import boto3
+        from botocore.stub import Stubber
+        from datetime import datetime, timedelta, timezone
+
+        UntaggedSpendRule = recommend_module.UntaggedSpendRule
+        rule = UntaggedSpendRule()
+
+        ce_client = boto3.client('ce', region_name='us-east-1')
+        stubber = Stubber(ce_client)
+
+        end_date = datetime.now(timezone.utc).date()
+        start_date = end_date - timedelta(days=30)
+
+        # Mock response for Environment tag
+        stubber.add_response(
+            'get_cost_and_usage',
+            {
+                'ResultsByTime': [{
+                    'TimePeriod': {
+                        'Start': start_date.isoformat(),
+                        'End': end_date.isoformat()
+                    },
+                    'Groups': [
+                        {
+                            'Keys': ['Environment$'],
+                            'Metrics': {
+                                'UnblendedCost': {
+                                    'Amount': '100.00',
+                                    'Unit': 'USD'
+                                }
+                            }
+                        }
+                    ],
+                    'Estimated': False
+                }]
+            },
+            expected_params={
+                'TimePeriod': {
+                    'Start': start_date.isoformat(),
+                    'End': end_date.isoformat()
+                },
+                'Granularity': 'MONTHLY',
+                'Metrics': ['UnblendedCost'],
+                'GroupBy': [
+                    {
+                        'Type': 'TAG',
+                        'Key': 'Environment'
+                    }
+                ]
+            }
+        )
+
+        # Mock response for CostCenter tag
+        stubber.add_response(
+            'get_cost_and_usage',
+            {
+                'ResultsByTime': [{
+                    'TimePeriod': {
+                        'Start': start_date.isoformat(),
+                        'End': end_date.isoformat()
+                    },
+                    'Groups': [
+                        {
+                            'Keys': ['CostCenter$'],
+                            'Metrics': {
+                                'UnblendedCost': {
+                                    'Amount': '100.00',
+                                    'Unit': 'USD'
+                                }
+                            }
+                        }
+                    ],
+                    'Estimated': False
+                }]
+            },
+            expected_params={
+                'TimePeriod': {
+                    'Start': start_date.isoformat(),
+                    'End': end_date.isoformat()
+                },
+                'Granularity': 'MONTHLY',
+                'Metrics': ['UnblendedCost'],
+                'GroupBy': [
+                    {
+                        'Type': 'TAG',
+                        'Key': 'CostCenter'
+                    }
+                ]
+            }
+        )
+
+        with stubber:
+            rule._ce_client = ce_client
+            result = rule.execute()
+
+        # fix_command should follow the expected pattern
+        for finding in result.findings:
+            assert finding.fix_command.startswith("aws ec2 create-tags --resources")
+            assert "Key=Environment,Value=TBD" in finding.fix_command
+            assert "Key=CostCenter,Value=TBD" in finding.fix_command
+
+    def test_untagged_spend_error_handling_no_credentials(self):
+        """Test error handling when AWS credentials are missing."""
+        import botocore.exceptions
+        from unittest.mock import Mock, patch
+
+        UntaggedSpendRule = recommend_module.UntaggedSpendRule
+        rule = UntaggedSpendRule()
+
+        # Mock the CE client to raise NoCredentialsError
+        mock_client = Mock()
+        mock_client.get_cost_and_usage.side_effect = botocore.exceptions.NoCredentialsError()
+        rule._ce_client = mock_client
+
+        result = rule.execute()
+
+        assert result.rule_id == "untagged-spend"
+        assert result.error is not None
+        assert "credentials" in result.error.lower()
+        assert len(result.findings) == 0
+
+    def test_untagged_spend_error_handling_client_error(self):
+        """Test error handling for AWS ClientError."""
+        import botocore.exceptions
+        from unittest.mock import Mock
+
+        UntaggedSpendRule = recommend_module.UntaggedSpendRule
+        rule = UntaggedSpendRule()
+
+        # Mock the CE client to raise ClientError
+        error_response = {'Error': {'Code': 'AccessDeniedException', 'Message': 'User not authorized'}}
+        mock_client = Mock()
+        mock_client.get_cost_and_usage.side_effect = botocore.exceptions.ClientError(
+            error_response, 'GetCostAndUsage'
+        )
+        rule._ce_client = mock_client
+
+        result = rule.execute()
+
+        assert result.rule_id == "untagged-spend"
+        assert result.error is not None
+        assert "AccessDeniedException" in result.error
+        assert len(result.findings) == 0
+
+    def test_untagged_spend_error_handling_unexpected_exception(self):
+        """Test error handling for unexpected exceptions."""
+        from unittest.mock import Mock
+
+        UntaggedSpendRule = recommend_module.UntaggedSpendRule
+        rule = UntaggedSpendRule()
+
+        # Mock the CE client to raise an unexpected exception
+        mock_client = Mock()
+        mock_client.get_cost_and_usage.side_effect = RuntimeError("Unexpected error")
+        rule._ce_client = mock_client
+
+        result = rule.execute()
+
+        assert result.rule_id == "untagged-spend"
+        assert result.error is not None
+        assert "Unexpected error" in result.error
+        assert len(result.findings) == 0
+
+    def test_untagged_spend_no_untagged_resources(self):
+        """Test rule returns empty findings when all resources are properly tagged."""
+        import boto3
+        from botocore.stub import Stubber
+        from datetime import datetime, timedelta, timezone
+
+        UntaggedSpendRule = recommend_module.UntaggedSpendRule
+        rule = UntaggedSpendRule()
+
+        ce_client = boto3.client('ce', region_name='us-east-1')
+        stubber = Stubber(ce_client)
+
+        end_date = datetime.now(timezone.utc).date()
+        start_date = end_date - timedelta(days=30)
+
+        # Mock response for Environment tag - all resources tagged
+        stubber.add_response(
+            'get_cost_and_usage',
+            {
+                'ResultsByTime': [{
+                    'TimePeriod': {
+                        'Start': start_date.isoformat(),
+                        'End': end_date.isoformat()
+                    },
+                    'Groups': [
+                        {
+                            'Keys': ['Environment$production'],
+                            'Metrics': {
+                                'UnblendedCost': {
+                                    'Amount': '500.00',
+                                    'Unit': 'USD'
+                                }
+                            }
+                        },
+                        {
+                            'Keys': ['Environment$development'],
+                            'Metrics': {
+                                'UnblendedCost': {
+                                    'Amount': '200.00',
+                                    'Unit': 'USD'
+                                }
+                            }
+                        }
+                    ],
+                    'Estimated': False
+                }]
+            },
+            expected_params={
+                'TimePeriod': {
+                    'Start': start_date.isoformat(),
+                    'End': end_date.isoformat()
+                },
+                'Granularity': 'MONTHLY',
+                'Metrics': ['UnblendedCost'],
+                'GroupBy': [
+                    {
+                        'Type': 'TAG',
+                        'Key': 'Environment'
+                    }
+                ]
+            }
+        )
+
+        # Mock response for CostCenter tag - all resources tagged
+        stubber.add_response(
+            'get_cost_and_usage',
+            {
+                'ResultsByTime': [{
+                    'TimePeriod': {
+                        'Start': start_date.isoformat(),
+                        'End': end_date.isoformat()
+                    },
+                    'Groups': [
+                        {
+                            'Keys': ['CostCenter$engineering'],
+                            'Metrics': {
+                                'UnblendedCost': {
+                                    'Amount': '500.00',
+                                    'Unit': 'USD'
+                                }
+                            }
+                        },
+                        {
+                            'Keys': ['CostCenter$marketing'],
+                            'Metrics': {
+                                'UnblendedCost': {
+                                    'Amount': '200.00',
+                                    'Unit': 'USD'
+                                }
+                            }
+                        }
+                    ],
+                    'Estimated': False
+                }]
+            },
+            expected_params={
+                'TimePeriod': {
+                    'Start': start_date.isoformat(),
+                    'End': end_date.isoformat()
+                },
+                'Granularity': 'MONTHLY',
+                'Metrics': ['UnblendedCost'],
+                'GroupBy': [
+                    {
+                        'Type': 'TAG',
+                        'Key': 'CostCenter'
+                    }
+                ]
+            }
+        )
+
+        with stubber:
+            rule._ce_client = ce_client
+            result = rule.execute()
+
+        assert result.rule_id == "untagged-spend"
+        assert result.error is None
+        assert len(result.findings) == 0
+
+    def test_untagged_spend_extends_base_rule(self):
+        """Test UntaggedSpendRule extends BaseRule."""
+        UntaggedSpendRule = recommend_module.UntaggedSpendRule
+        BaseRule = recommend_module.BaseRule
+        rule = UntaggedSpendRule()
+        assert isinstance(rule, BaseRule)
+
+    def test_untagged_spend_groupby_uses_tag_type(self):
+        """Test that GroupBy uses TAG type for required tags."""
+        import boto3
+        from botocore.stub import Stubber
+        from datetime import datetime, timedelta, timezone
+
+        UntaggedSpendRule = recommend_module.UntaggedSpendRule
+        rule = UntaggedSpendRule()
+
+        ce_client = boto3.client('ce', region_name='us-east-1')
+        stubber = Stubber(ce_client)
+
+        end_date = datetime.now(timezone.utc).date()
+        start_date = end_date - timedelta(days=30)
+
+        # Add response for Environment tag - verifying GroupBy Type is TAG
+        stubber.add_response(
+            'get_cost_and_usage',
+            {
+                'ResultsByTime': [{
+                    'TimePeriod': {
+                        'Start': start_date.isoformat(),
+                        'End': end_date.isoformat()
+                    },
+                    'Groups': [],
+                    'Estimated': False
+                }]
+            },
+            expected_params={
+                'TimePeriod': {
+                    'Start': start_date.isoformat(),
+                    'End': end_date.isoformat()
+                },
+                'Granularity': 'MONTHLY',
+                'Metrics': ['UnblendedCost'],
+                'GroupBy': [
+                    {
+                        'Type': 'TAG',  # Verifying TAG type is used
+                        'Key': 'Environment'
+                    }
+                ]
+            }
+        )
+
+        # Add response for CostCenter tag - verifying GroupBy Type is TAG
+        stubber.add_response(
+            'get_cost_and_usage',
+            {
+                'ResultsByTime': [{
+                    'TimePeriod': {
+                        'Start': start_date.isoformat(),
+                        'End': end_date.isoformat()
+                    },
+                    'Groups': [],
+                    'Estimated': False
+                }]
+            },
+            expected_params={
+                'TimePeriod': {
+                    'Start': start_date.isoformat(),
+                    'End': end_date.isoformat()
+                },
+                'Granularity': 'MONTHLY',
+                'Metrics': ['UnblendedCost'],
+                'GroupBy': [
+                    {
+                        'Type': 'TAG',  # Verifying TAG type is used
+                        'Key': 'CostCenter'
+                    }
+                ]
+            }
+        )
+
+        with stubber:
+            rule._ce_client = ce_client
+            result = rule.execute()
+
+        # If we got here without StubResponseError, the GroupBy params matched
+        assert result.error is None
