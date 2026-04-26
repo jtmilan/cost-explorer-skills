@@ -764,3 +764,254 @@ class CostAnomalyInvestigator:
             cause.rank = i
 
         return causes
+
+
+# ============================================================================
+# ReportGenerator Class
+# ============================================================================
+
+class ReportGenerator:
+    """
+    Converts InvestigationReport data into markdown report string.
+    """
+
+    def generate(self, report: InvestigationReport) -> str:
+        """
+        Generate markdown report from InvestigationReport.
+
+        Returns:
+            Multi-line markdown string with fixed structure:
+            1. Header: "# Cost Spike: $X,XXX on YYYY-MM-DD (SERVICE)"
+            2. Spike Summary section: Baseline vs. spike cost, delta, delta_percent
+            3. Likely Causes section: 1-3 cause items (numbered)
+            4. Evidence section: CloudTrail events + metrics summary
+            5. Footer: "Investigation completed at TIMESTAMP"
+        """
+        # Build sections
+        header = self._format_spike_header(report.spike)
+        summary = self._format_spike_summary(report.spike)
+        causes = self._format_causes(report.likely_causes)
+        events = self._format_cloudtrail_events(report.events)
+        metrics = self._format_metrics_summary(report.metrics)
+        footer = self._format_footer(report.investigation_date)
+
+        # Combine all sections with proper spacing
+        sections = [
+            header,
+            '',
+            summary,
+            '',
+            causes,
+            '',
+            '## Evidence',
+            '',
+            events,
+            '',
+            metrics,
+            '',
+            footer
+        ]
+
+        return '\n'.join(sections)
+
+    def _format_spike_header(self, spike: SpikeSummary) -> str:
+        """
+        Format spike header line: "# Cost Spike: $X,XXX on YYYY-MM-DD (SERVICE)"
+        """
+        return f"# Cost Spike: ${spike.delta:,.2f} on {spike.date} ({spike.service})"
+
+    def _format_spike_summary(self, spike: SpikeSummary) -> str:
+        """
+        Format spike summary block.
+        """
+        lines = ["## Spike Summary"]
+
+        if spike.baseline_cost == 0.0:
+            lines.append("No baseline available (previous month has no data)")
+        else:
+            lines.append(f"Baseline (previous month average): ${spike.baseline_cost:,.2f}/day")
+
+        lines.append(f"Spike cost ({spike.date}): ${spike.spike_cost:,.2f}/day")
+
+        if spike.baseline_cost > 0:
+            change_label = "increase" if spike.delta > 0 else "decrease"
+            lines.append(f"Delta: ${abs(spike.delta):,.2f} ({abs(spike.delta_percent):.1f}% {change_label})")
+        else:
+            if spike.spike_cost > 0:
+                lines.append(f"Delta: ${spike.spike_cost:,.2f}")
+
+        return '\n'.join(lines)
+
+    def _format_causes(self, causes: List[LikelyCause]) -> str:
+        """
+        Format likely causes section.
+        """
+        lines = ["## Likely Causes"]
+
+        for cause in causes:
+            lines.append(f"{cause.rank}. {cause.title}: {cause.description}")
+
+        return '\n'.join(lines)
+
+    def _format_cloudtrail_events(self, events: List[CloudTrailEvent]) -> str:
+        """
+        Format CloudTrail events as markdown table or message.
+        """
+        lines = ["### CloudTrail Events"]
+
+        if not events:
+            lines.append("No mutating events found on this date.")
+            return '\n'.join(lines)
+
+        # Build table header
+        lines.append("| Timestamp | Principal | Action | Resources |")
+        lines.append("|-----------|-----------|--------|-----------|")
+
+        # Add event rows
+        for event in events:
+            timestamp_str = event.timestamp.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+            # Truncate principal if too long
+            principal = event.principal
+            if len(principal) > 50:
+                principal = principal[:47] + "..."
+
+            # Join multiple resources with comma
+            resources_str = ', '.join(event.resource) if event.resource else ''
+
+            lines.append(
+                f"| {timestamp_str} | {principal} | {event.action} | {resources_str} |"
+            )
+
+        return '\n'.join(lines)
+
+    def _format_metrics_summary(self, metrics: Dict[str, List[MetricDatapoint]]) -> str:
+        """
+        Format metrics summary (brief, not exhaustive).
+        """
+        lines = ["### Metrics"]
+
+        if not metrics:
+            lines.append("No metrics available for this service on this date.")
+            return '\n'.join(lines)
+
+        # Sort metrics alphabetically
+        for metric_name in sorted(metrics.keys()):
+            datapoints = metrics[metric_name]
+            if not datapoints:
+                continue
+
+            # Extract values by statistic
+            stats_dict = {}
+            for dp in datapoints:
+                stat = dp.statistic
+                if stat not in stats_dict:
+                    stats_dict[stat] = []
+                stats_dict[stat].append(dp.value)
+
+            # Build metric line
+            parts = [metric_name + ":"]
+
+            # Average
+            if 'Average' in stats_dict:
+                avg_val = sum(stats_dict['Average']) / len(stats_dict['Average'])
+                unit = self._normalize_unit(metrics[metric_name][0].unit)
+                if unit:
+                    parts.append(f"{avg_val:.1f}{unit} average")
+                else:
+                    parts.append(f"{avg_val:.1f} average")
+
+            # Maximum
+            if 'Maximum' in stats_dict:
+                max_val = max(stats_dict['Maximum'])
+                unit = self._normalize_unit(metrics[metric_name][0].unit)
+                if unit:
+                    parts.append(f"max {max_val:.1f}{unit}")
+                else:
+                    parts.append(f"max {max_val:.1f}")
+
+            # Sum (for aggregated metrics)
+            if 'Sum' in stats_dict and 'Average' not in stats_dict:
+                sum_val = sum(stats_dict['Sum'])
+                unit = self._normalize_unit(metrics[metric_name][0].unit)
+                if unit:
+                    parts.append(f"{sum_val:.1f}{unit} total")
+                else:
+                    parts.append(f"{sum_val:.1f} total")
+
+            lines.append(' '.join(parts) + ',')
+
+        # Remove trailing commas and clean up
+        if lines[-1].endswith(','):
+            lines[-1] = lines[-1][:-1]
+
+        return '\n'.join(lines)
+
+    def _normalize_unit(self, unit: str) -> str:
+        """
+        Normalize CloudWatch unit to short form.
+        """
+        if unit == 'Percent':
+            return '%'
+        elif unit == 'Bytes':
+            return ' GB'  # Note: values should be divided by 1e9 by caller
+        elif unit == 'Count' or unit == 'None':
+            return ''
+        else:
+            return ''
+
+    def _format_footer(self, investigation_date: datetime) -> str:
+        """
+        Format footer with investigation timestamp.
+        """
+        timestamp_str = investigation_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+        return f"---\nInvestigation completed at {timestamp_str}"
+
+
+# ============================================================================
+# FixtureProvider Class
+# ============================================================================
+
+class FixtureProvider:
+    """
+    Provides deterministic fixture data for --dry-run mode.
+    No AWS calls; returns hardcoded markdown report.
+    """
+
+    @staticmethod
+    def get_fixture_report() -> str:
+        """
+        Return deterministic markdown report for testing.
+
+        Returns:
+            Multi-line markdown string (identical on every invocation)
+            Fixture matches the exact structure generated by ReportGenerator.generate()
+        """
+        return """\
+# Cost Spike: $5,234.56 on 2024-03-15 (EC2)
+
+## Spike Summary
+Baseline (previous month average): $1,200.00/day
+Spike cost (2024-03-15): $6,434.56/day
+Delta: $5,234.56 (435.3% increase)
+
+## Likely Causes
+1. EC2 instance launch surge: 15 instances launched on 2024-03-15
+2. Data transfer spike: NetworkOut exceeded 100 Mbps
+3. Configuration or deployment activity: 25 mutating events detected
+
+## Evidence
+
+### CloudTrail Events
+| Timestamp | Principal | Action | Resources |
+|-----------|-----------|--------|-----------|
+| 2024-03-15T10:30:45Z | arn:aws:iam::123456789012:user/alice | RunInstances | i-1234567890abcdef0 |
+| 2024-03-15T10:45:20Z | arn:aws:iam::123456789012:role/lambda-role | RunInstances | i-0987654321fedcba0 |
+
+### Metrics
+CPUUtilization: 45.2% average, max 89.5%,
+NetworkIn: 1.2 GB total,
+NetworkOut: 2.5 GB total
+
+---
+Investigation completed at 2024-03-15T14:30:00Z"""

@@ -1116,6 +1116,156 @@ class TestCostAnomalyInvestigatorDeriveCauses:
                 assert cause.rank == i
 
 
+class TestFixtureProvider:
+    """Test FixtureProvider class for --dry-run mode."""
+
+    def test_fixture_provider_determinism(self):
+        """Test get_fixture_report() returns identical output on repeated calls."""
+        # Call get_fixture_report() multiple times
+        report1 = investigate_module.FixtureProvider.get_fixture_report()
+        report2 = investigate_module.FixtureProvider.get_fixture_report()
+        report3 = investigate_module.FixtureProvider.get_fixture_report()
+
+        # All should be identical (deterministic)
+        assert report1 == report2, "Fixture not deterministic on second call"
+        assert report1 == report3, "Fixture not deterministic on third call"
+        assert isinstance(report1, str), "Fixture must be a string"
+        assert len(report1) > 0, "Fixture must not be empty"
+
+    def test_fixture_report_structure_spike_header(self):
+        """Test fixture includes spike header with correct format."""
+        fixture = investigate_module.FixtureProvider.get_fixture_report()
+
+        # Verify spike header exists and matches expected format
+        assert "# Cost Spike:" in fixture, "Missing spike header"
+        assert "$5,234.56" in fixture, "Missing spike amount"
+        assert "2024-03-15" in fixture, "Missing spike date"
+        assert "(EC2)" in fixture, "Missing service name"
+        assert "# Cost Spike: $5,234.56 on 2024-03-15 (EC2)" in fixture, (
+            "Spike header format incorrect"
+        )
+
+    def test_fixture_report_structure_spike_summary(self):
+        """Test fixture includes Spike Summary section with all required fields."""
+        fixture = investigate_module.FixtureProvider.get_fixture_report()
+
+        # Verify Spike Summary section
+        assert "## Spike Summary" in fixture, "Missing Spike Summary header"
+        assert "Baseline (previous month average):" in fixture, "Missing baseline"
+        assert "$1,200.00/day" in fixture, "Missing baseline cost"
+        assert "Spike cost (2024-03-15):" in fixture, "Missing spike cost label"
+        assert "$6,434.56/day" in fixture, "Missing spike cost value"
+        assert "Delta:" in fixture, "Missing delta"
+        assert "$5,234.56" in fixture, "Missing delta amount"
+        assert "435.3%" in fixture, "Missing delta percent"
+        assert "increase" in fixture, "Missing increase label"
+
+    def test_fixture_report_structure_likely_causes(self):
+        """Test fixture includes Likely Causes section with numbered items."""
+        fixture = investigate_module.FixtureProvider.get_fixture_report()
+
+        # Verify Likely Causes section
+        assert "## Likely Causes" in fixture, "Missing Likely Causes header"
+        assert "1. EC2 instance launch surge:" in fixture, "Missing cause 1"
+        assert "2. Data transfer spike:" in fixture, "Missing cause 2"
+        assert "3. Configuration or deployment activity:" in fixture, "Missing cause 3"
+        assert "15 instances launched" in fixture, "Missing cause 1 details"
+        assert "NetworkOut exceeded 100 Mbps" in fixture, "Missing cause 2 details"
+        assert "25 mutating events" in fixture, "Missing cause 3 details"
+
+    def test_fixture_report_structure_cloudtrail_events(self):
+        """Test fixture includes CloudTrail Events section with sample data."""
+        fixture = investigate_module.FixtureProvider.get_fixture_report()
+
+        # Verify CloudTrail Events section
+        assert "### CloudTrail Events" in fixture, "Missing CloudTrail Events header"
+        assert "| Timestamp | Principal | Action | Resources |" in fixture, (
+            "Missing table header"
+        )
+        assert "|-----------|-----------|--------|-----------|" in fixture, (
+            "Missing table separator"
+        )
+        assert "2024-03-15T10:30:45Z" in fixture, "Missing event timestamp 1"
+        assert "2024-03-15T10:45:20Z" in fixture, "Missing event timestamp 2"
+        assert "arn:aws:iam::123456789012:user/alice" in fixture, "Missing principal 1"
+        assert "arn:aws:iam::123456789012:role/lambda-role" in fixture, "Missing principal 2"
+        assert "RunInstances" in fixture, "Missing action"
+        assert "i-1234567890abcdef0" in fixture, "Missing resource 1"
+        assert "i-0987654321fedcba0" in fixture, "Missing resource 2"
+
+    def test_fixture_report_structure_metrics(self):
+        """Test fixture includes Metrics section with sample data."""
+        fixture = investigate_module.FixtureProvider.get_fixture_report()
+
+        # Verify Metrics section
+        assert "### Metrics" in fixture, "Missing Metrics header"
+        assert "CPUUtilization:" in fixture, "Missing CPUUtilization metric"
+        assert "45.2%" in fixture, "Missing CPUUtilization value"
+        assert "average" in fixture, "Missing average statistic"
+        assert "max 89.5%" in fixture, "Missing max statistic"
+        assert "NetworkIn:" in fixture, "Missing NetworkIn metric"
+        assert "1.2 GB" in fixture, "Missing NetworkIn value"
+        assert "NetworkOut:" in fixture, "Missing NetworkOut metric"
+        assert "2.5 GB" in fixture, "Missing NetworkOut value"
+
+    def test_fixture_report_structure_footer(self):
+        """Test fixture includes footer with investigation timestamp."""
+        fixture = investigate_module.FixtureProvider.get_fixture_report()
+
+        # Verify footer
+        assert "---" in fixture, "Missing footer separator"
+        assert "Investigation completed at" in fixture, "Missing investigation footer"
+        assert "2024-03-15T14:30:00Z" in fixture, "Missing investigation timestamp"
+
+    def test_fixture_report_structure_evidence_section(self):
+        """Test fixture includes Evidence section header."""
+        fixture = investigate_module.FixtureProvider.get_fixture_report()
+
+        # Verify Evidence section exists
+        assert "## Evidence" in fixture, "Missing Evidence header"
+
+    def test_fixture_no_aws_calls(self):
+        """Verify get_fixture_report() makes no AWS calls."""
+        import sys
+        from unittest.mock import patch
+
+        # Monitor if boto3.client or similar is called
+        with patch('boto3.client') as mock_boto3:
+            # Call get_fixture_report
+            fixture = investigate_module.FixtureProvider.get_fixture_report()
+
+            # Verify boto3.client was NOT called
+            assert not mock_boto3.called, "FixtureProvider called boto3.client (AWS API)"
+
+        # Also verify the fixture is a valid string
+        assert isinstance(fixture, str)
+        assert len(fixture) > 0
+
+    def test_fixture_is_valid_markdown(self):
+        """Verify fixture output is valid markdown."""
+        fixture = investigate_module.FixtureProvider.get_fixture_report()
+
+        # Basic markdown validation
+        # Check for properly formatted headers
+        lines = fixture.split('\n')
+
+        # Verify has h1 header
+        h1_count = sum(1 for line in lines if line.startswith('# '))
+        assert h1_count >= 1, "Missing H1 header"
+
+        # Verify has h2 headers
+        h2_count = sum(1 for line in lines if line.startswith('## '))
+        assert h2_count >= 3, "Missing H2 headers (need at least 3)"
+
+        # Verify has h3 headers
+        h3_count = sum(1 for line in lines if line.startswith('### '))
+        assert h3_count >= 2, "Missing H3 headers (need at least 2)"
+
+        # Verify has table separator
+        table_seps = sum(1 for line in lines if line.startswith('|---'))
+        assert table_seps >= 1, "Missing table separator"
+
+
 class TestCostAnomalyInvestigatorOrchestration:
     """Test CostAnomalyInvestigator.investigate() orchestration method."""
 
