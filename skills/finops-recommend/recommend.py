@@ -12,6 +12,7 @@ This module provides:
 - IdleEc2Rule: Rule detecting EC2 instances with <5% avg CPU over 7 days
 - OversizedRdsRule: Rule to detect underutilized RDS instances
 - OrphanEbsRule: Rule to detect unattached EBS volumes older than 14 days
+- UntaggedSpendRule: Rule to detect resources missing required cost-allocation tags
 - FixtureProvider: Static class providing deterministic fixture data for --dry-run mode
 """
 
@@ -645,6 +646,162 @@ class OrphanEbsRule(BaseRule):
                 findings=[],
                 error=f"Unexpected error: {e}"
             )
+
+
+# ============================================================================
+# UntaggedSpendRule Implementation
+# ============================================================================
+
+class UntaggedSpendRule(BaseRule):
+    """Detects resources missing required cost-allocation tags.
+
+    AWS APIs:
+        - CostExplorer.GetCostAndUsage:
+            GroupBy=[{Type: TAG, Key: <required_tag>}]
+            TimePeriod=last 30 days
+
+    Detection Logic:
+        1. Query Cost Explorer grouped by each required tag
+        2. Find resources where tag value is empty or missing
+        3. Aggregate untagged spend by resource
+
+    Required Tags (hardcoded):
+        - "Environment"
+        - "CostCenter"
+
+    Savings Estimation:
+        Returns $0.00 (tagging doesn't directly save money,
+        but enables cost attribution)
+
+    Fix Command:
+        aws ec2 create-tags --resources {resource_id} --tags Key=Environment,Value=TBD Key=CostCenter,Value=TBD
+    """
+
+    REQUIRED_TAGS: List[str] = ["Environment", "CostCenter"]
+    LOOKBACK_DAYS: int = 30
+
+    def __init__(self):
+        """Initialize UntaggedSpendRule with AWS Cost Explorer client."""
+        self._ce_client = None
+
+    def _get_ce_client(self):
+        """Lazy initialization of Cost Explorer client."""
+        if self._ce_client is None:
+            import boto3
+            self._ce_client = boto3.client('ce', region_name='us-east-1')
+        return self._ce_client
+
+    @property
+    def rule_id(self) -> str:
+        return "untagged-spend"
+
+    def execute(self) -> RuleResult:
+        """Execute untagged spend detection.
+
+        Returns:
+            RuleResult with findings for resources missing required tags,
+            or error message if AWS calls fail.
+        """
+        try:
+            findings = self._detect_untagged_resources()
+            return RuleResult(rule_id=self.rule_id, findings=findings, error=None)
+        except Exception as e:
+            # Import botocore here to handle specific exceptions
+            import botocore.exceptions
+            if isinstance(e, botocore.exceptions.NoCredentialsError):
+                return RuleResult(
+                    rule_id=self.rule_id,
+                    findings=[],
+                    error=f"AWS credentials not found: {e}"
+                )
+            elif isinstance(e, botocore.exceptions.ClientError):
+                error_code = e.response.get("Error", {}).get("Code", "Unknown")
+                return RuleResult(
+                    rule_id=self.rule_id,
+                    findings=[],
+                    error=f"{error_code}: {e}"
+                )
+            else:
+                return RuleResult(
+                    rule_id=self.rule_id,
+                    findings=[],
+                    error=f"Unexpected error: {e}"
+                )
+
+    def _detect_untagged_resources(self) -> List[Finding]:
+        """Detect resources missing required tags using Cost Explorer.
+
+        Returns:
+            List of Finding objects for resources with missing or empty tags.
+        """
+        ce_client = self._get_ce_client()
+        findings = []
+
+        # Calculate time period (last 30 days)
+        end_date = datetime.now(timezone.utc).date()
+        start_date = end_date - timedelta(days=self.LOOKBACK_DAYS)
+
+        # Track resources with missing tags
+        untagged_resources = set()
+
+        # Query Cost Explorer for each required tag
+        for tag in self.REQUIRED_TAGS:
+            response = ce_client.get_cost_and_usage(
+                TimePeriod={
+                    'Start': start_date.isoformat(),
+                    'End': end_date.isoformat()
+                },
+                Granularity='MONTHLY',
+                Metrics=['UnblendedCost'],
+                GroupBy=[
+                    {
+                        'Type': 'TAG',
+                        'Key': tag
+                    }
+                ]
+            )
+
+            # Parse response and find resources with missing or empty tag values
+            for result in response.get('ResultsByTime', []):
+                for group in result.get('Groups', []):
+                    # Group key format is "tag_key$tag_value"
+                    keys = group.get('Keys', [])
+                    if keys:
+                        key_value = keys[0]
+                        # Extract tag value from the key
+                        # Format: "Environment$" (empty) or "Environment$production"
+                        tag_value = key_value.split('$', 1)[1] if '$' in key_value else ''
+
+                        # Check for empty or missing tag values
+                        if not tag_value or tag_value == '':
+                            # Get the amount for this untagged spend
+                            amount = float(group.get('Metrics', {}).get('UnblendedCost', {}).get('Amount', '0'))
+                            if amount > 0:
+                                # We can't get specific resource IDs from Cost Explorer grouping
+                                # So we use a placeholder to indicate untagged resources
+                                untagged_resources.add(f"untagged-{tag}")
+
+        # Create findings for each resource with missing tags
+        for resource_id in untagged_resources:
+            # Determine which tags are missing based on the resource_id pattern
+            missing_tags = [tag for tag in self.REQUIRED_TAGS if f"untagged-{tag}" in untagged_resources]
+
+            if missing_tags:
+                # Create ARN using a placeholder pattern since Cost Explorer
+                # doesn't provide specific resource ARNs for grouped data
+                arn = f"arn:aws:ce:us-east-1:untagged:cost/{resource_id}"
+
+                finding = Finding(
+                    arn=arn,
+                    finding=f"Resources missing required tags: {', '.join(missing_tags)}",
+                    est_monthly_saved_usd=0.00,
+                    fix_command=f"aws ec2 create-tags --resources {resource_id} --tags Key=Environment,Value=TBD Key=CostCenter,Value=TBD"
+                )
+                findings.append(finding)
+                break  # Only add one finding per untagged group
+
+        return findings
+
 
 class FixtureProvider:
     """Provides deterministic fixture data for --dry-run mode.
