@@ -1307,6 +1307,8 @@ class TestOversizedRdsRule:
 
     def test_oversized_rds_detects_low_cpu_instance(self):
         """Test rule detects RDS instance with <30% CPU (12% avg)."""
+        import boto3
+        from botocore.stub import Stubber
         rule = OversizedRdsRule()
 
         # Setup RDS stubber
@@ -1362,6 +1364,8 @@ class TestOversizedRdsRule:
 
     def test_oversized_rds_no_findings_high_cpu(self):
         """Test rule returns no findings for instance with >30% CPU (40% avg)."""
+        import boto3
+        from botocore.stub import Stubber
         rule = OversizedRdsRule()
 
         # Setup RDS stubber
@@ -1413,6 +1417,8 @@ class TestOversizedRdsRule:
 
     def test_oversized_rds_handles_errors_gracefully(self):
         """Test rule handles errors gracefully and returns RuleResult with error."""
+        import boto3
+        from botocore.stub import Stubber
         rule = OversizedRdsRule()
 
         # Setup RDS stubber with error
@@ -1442,6 +1448,8 @@ class TestOversizedRdsRule:
 
     def test_oversized_rds_correct_arn_format(self):
         """Test that findings have correct ARN format arn:aws:rds:..."""
+        import boto3
+        from botocore.stub import Stubber
         rule = OversizedRdsRule()
 
         # Setup RDS stubber
@@ -1496,6 +1504,8 @@ class TestOversizedRdsRule:
 
     def test_oversized_rds_fix_command_includes_smaller_class(self):
         """Test fix_command includes downsized instance class from DOWNSIZE_MAP."""
+        import boto3
+        from botocore.stub import Stubber
         rule = OversizedRdsRule()
 
         # Setup RDS stubber
@@ -1552,6 +1562,8 @@ class TestOversizedRdsRule:
 
     def test_oversized_rds_savings_calculation(self):
         """Test monthly savings calculated as current_monthly_cost * SAVINGS_RATIO."""
+        import boto3
+        from botocore.stub import Stubber
         rule = OversizedRdsRule()
 
         # Setup RDS stubber
@@ -1610,6 +1622,8 @@ class TestOversizedRdsRule:
 
     def test_oversized_rds_no_metrics_data(self):
         """Test rule handles instances without CloudWatch metrics gracefully."""
+        import boto3
+        from botocore.stub import Stubber
         rule = OversizedRdsRule()
 
         # Setup RDS stubber
@@ -1691,6 +1705,8 @@ class TestOrphanEbsRule:
 
     def test_orphan_ebs_detects_old_unattached_volume(self):
         """Test rule detects volume unattached >14 days."""
+        import boto3
+        from botocore.stub import Stubber
         rule = OrphanEbsRule()
 
         ec2_client = boto3.client('ec2', region_name='us-east-1')
@@ -1733,6 +1749,8 @@ class TestOrphanEbsRule:
 
     def test_orphan_ebs_ignores_recent_volume(self):
         """Test rule ignores volume unattached <14 days (7 days old)."""
+        import boto3
+        from botocore.stub import Stubber
         rule = OrphanEbsRule()
 
         ec2_client = boto3.client('ec2', region_name='us-east-1')
@@ -1770,6 +1788,8 @@ class TestOrphanEbsRule:
 
     def test_orphan_ebs_savings_calculation(self):
         """Test savings calculation uses volume size * pricing."""
+        import boto3
+        from botocore.stub import Stubber
         rule = OrphanEbsRule()
 
         ec2_client = boto3.client('ec2', region_name='us-east-1')
@@ -1808,6 +1828,8 @@ class TestOrphanEbsRule:
 
     def test_orphan_ebs_savings_gp3_pricing(self):
         """Test savings calculation for gp3 volume type."""
+        import boto3
+        from botocore.stub import Stubber
         rule = OrphanEbsRule()
 
         ec2_client = boto3.client('ec2', region_name='us-east-1')
@@ -1846,6 +1868,8 @@ class TestOrphanEbsRule:
 
     def test_orphan_ebs_error_handling_client_error(self):
         """Test error handling for ClientError."""
+        import boto3
+        from botocore.stub import Stubber
         rule = OrphanEbsRule()
 
         ec2_client = boto3.client('ec2', region_name='us-east-1')
@@ -1869,6 +1893,8 @@ class TestOrphanEbsRule:
 
     def test_orphan_ebs_no_volumes(self):
         """Test rule handles no available volumes."""
+        import boto3
+        from botocore.stub import Stubber
         rule = OrphanEbsRule()
 
         ec2_client = boto3.client('ec2', region_name='us-east-1')
@@ -1895,6 +1921,8 @@ class TestOrphanEbsRule:
 
     def test_orphan_ebs_arn_format(self):
         """Test ARN format is arn:aws:ec2:region:account:volume/vol-xxx."""
+        import boto3
+        from botocore.stub import Stubber
         rule = OrphanEbsRule()
 
         ec2_client = boto3.client('ec2', region_name='us-east-1')
@@ -1936,6 +1964,8 @@ class TestOrphanEbsRule:
 
     def test_orphan_ebs_fix_command_format(self):
         """Test fix_command format is 'aws ec2 delete-volume --volume-id {vol_id}'."""
+        import boto3
+        from botocore.stub import Stubber
         rule = OrphanEbsRule()
 
         ec2_client = boto3.client('ec2', region_name='us-east-1')
@@ -1973,6 +2003,8 @@ class TestOrphanEbsRule:
 
     def test_orphan_ebs_multiple_volumes_mixed_ages(self):
         """Test rule only flags volumes older than 14 days when mixed ages present."""
+        import boto3
+        from botocore.stub import Stubber
         rule = OrphanEbsRule()
 
         ec2_client = boto3.client('ec2', region_name='us-east-1')
@@ -2637,3 +2669,293 @@ class TestUntaggedSpendRule:
 
         # If we got here without StubResponseError, the GroupBy params matched
         assert result.error is None
+
+
+# ============================================================================
+# Tests for CLI Integration (main(), validate_rules(), execute_rules())
+# ============================================================================
+
+# Import CLI components
+validate_rules = recommend_module.validate_rules
+execute_rules = recommend_module.execute_rules
+RULE_REGISTRY = recommend_module.RULE_REGISTRY
+main = recommend_module.main
+
+
+class TestValidateRules:
+    """Tests for validate_rules() argument validator."""
+
+    def test_validate_rules_single_rule(self):
+        """Test parsing single rule ID."""
+        result = validate_rules("idle-ec2")
+        assert result == ["idle-ec2"]
+
+    def test_validate_rules_multiple_rules(self):
+        """Test parsing comma-separated rule IDs."""
+        result = validate_rules("idle-ec2,orphan-ebs")
+        assert result == ["idle-ec2", "orphan-ebs"]
+
+    def test_validate_rules_all_rules(self):
+        """Test parsing all valid rule IDs."""
+        result = validate_rules("idle-ec2,oversized-rds,orphan-ebs,untagged-spend")
+        assert len(result) == 4
+        assert "idle-ec2" in result
+        assert "oversized-rds" in result
+        assert "orphan-ebs" in result
+        assert "untagged-spend" in result
+
+    def test_validate_rules_with_spaces(self):
+        """Test parsing rule IDs with whitespace around commas."""
+        result = validate_rules("idle-ec2 , orphan-ebs")
+        assert result == ["idle-ec2", "orphan-ebs"]
+
+    def test_validate_rules_invalid_raises_error(self):
+        """Test invalid rule ID raises ArgumentTypeError."""
+        import argparse
+        with pytest.raises(argparse.ArgumentTypeError) as excinfo:
+            validate_rules("invalid-rule")
+        assert "Invalid rules" in str(excinfo.value)
+        assert "invalid-rule" in str(excinfo.value)
+
+    def test_validate_rules_mixed_valid_invalid_raises_error(self):
+        """Test mix of valid and invalid rule IDs raises error."""
+        import argparse
+        with pytest.raises(argparse.ArgumentTypeError) as excinfo:
+            validate_rules("idle-ec2,invalid-rule")
+        assert "Invalid rules" in str(excinfo.value)
+        assert "invalid-rule" in str(excinfo.value)
+
+    def test_validate_rules_error_shows_valid_options(self):
+        """Test error message shows valid rule options."""
+        import argparse
+        with pytest.raises(argparse.ArgumentTypeError) as excinfo:
+            validate_rules("bad-rule")
+        error_msg = str(excinfo.value)
+        assert "Valid options:" in error_msg
+        assert "idle-ec2" in error_msg
+        assert "oversized-rds" in error_msg
+        assert "orphan-ebs" in error_msg
+        assert "untagged-spend" in error_msg
+
+
+class TestRuleRegistry:
+    """Tests for RULE_REGISTRY constant."""
+
+    def test_rule_registry_has_four_rules(self):
+        """Test RULE_REGISTRY contains all 4 rules."""
+        assert len(RULE_REGISTRY) == 4
+
+    def test_rule_registry_keys_match_valid_rules(self):
+        """Test RULE_REGISTRY keys match expected rule IDs."""
+        expected_keys = {"idle-ec2", "oversized-rds", "orphan-ebs", "untagged-spend"}
+        assert set(RULE_REGISTRY.keys()) == expected_keys
+
+    def test_rule_registry_values_are_rule_classes(self):
+        """Test RULE_REGISTRY values are BaseRule subclasses."""
+        for rule_id, rule_class in RULE_REGISTRY.items():
+            assert issubclass(rule_class, BaseRule), f"{rule_id} is not a BaseRule subclass"
+
+    def test_rule_registry_classes_match_ids(self):
+        """Test each registered rule class has correct rule_id property."""
+        for rule_id, rule_class in RULE_REGISTRY.items():
+            instance = rule_class()
+            assert instance.rule_id == rule_id
+
+
+class TestExecuteRules:
+    """Tests for execute_rules() function."""
+
+    def test_execute_rules_returns_list_of_results(self):
+        """Test execute_rules returns List[RuleResult]."""
+        # Using mocked rules by injecting fixture data path
+        # For this test, we'll use the actual rules with mocked AWS clients
+        from unittest.mock import patch, Mock
+
+        # Mock the rule classes to return fixture-like data
+        with patch.object(IdleEc2Rule, 'execute') as mock_idle, \
+             patch.object(OrphanEbsRule, 'execute') as mock_ebs:
+
+            mock_idle.return_value = RuleResult(
+                rule_id="idle-ec2",
+                findings=[],
+                error=None
+            )
+            mock_ebs.return_value = RuleResult(
+                rule_id="orphan-ebs",
+                findings=[],
+                error=None
+            )
+
+            results = execute_rules(["idle-ec2", "orphan-ebs"])
+
+            assert len(results) == 2
+            assert all(isinstance(r, RuleResult) for r in results)
+            assert results[0].rule_id == "idle-ec2"
+            assert results[1].rule_id == "orphan-ebs"
+
+    def test_execute_rules_preserves_order(self):
+        """Test execute_rules returns results in same order as input."""
+        from unittest.mock import patch
+
+        with patch.object(IdleEc2Rule, 'execute') as mock_idle, \
+             patch.object(OversizedRdsRule, 'execute') as mock_rds, \
+             patch.object(OrphanEbsRule, 'execute') as mock_ebs:
+
+            mock_idle.return_value = RuleResult("idle-ec2", [], None)
+            mock_rds.return_value = RuleResult("oversized-rds", [], None)
+            mock_ebs.return_value = RuleResult("orphan-ebs", [], None)
+
+            results = execute_rules(["orphan-ebs", "idle-ec2", "oversized-rds"])
+
+            assert results[0].rule_id == "orphan-ebs"
+            assert results[1].rule_id == "idle-ec2"
+            assert results[2].rule_id == "oversized-rds"
+
+    def test_execute_rules_isolates_errors(self):
+        """Test that one rule's error doesn't affect others."""
+        from unittest.mock import patch
+
+        with patch.object(IdleEc2Rule, 'execute') as mock_idle, \
+             patch.object(OrphanEbsRule, 'execute') as mock_ebs:
+
+            # First rule succeeds
+            mock_idle.return_value = RuleResult("idle-ec2", [], None)
+            # Second rule fails
+            mock_ebs.return_value = RuleResult("orphan-ebs", [], "Some error")
+
+            results = execute_rules(["idle-ec2", "orphan-ebs"])
+
+            assert len(results) == 2
+            assert results[0].error is None  # First succeeded
+            assert results[1].error == "Some error"  # Second failed
+
+
+class TestMainCli:
+    """Tests for main() CLI argument parsing and execution."""
+
+    def test_dry_run_no_aws_calls(self, monkeypatch, capsys):
+        """--dry-run works without AWS credentials."""
+        # Remove AWS credentials
+        monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+        monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+        monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+        monkeypatch.delenv("AWS_PROFILE", raising=False)
+        monkeypatch.setattr(sys, 'argv', ['recommend.py', '--dry-run'])
+
+        result = main()
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Findings" in captured.out
+        assert "FinOps Recommendations Report" in captured.out
+
+    def test_rules_flag_filters_output(self, monkeypatch, capsys):
+        """--rules flag limits execution to specified rules."""
+        monkeypatch.setattr(sys, 'argv',
+            ['recommend.py', '--dry-run', '--rules', 'idle-ec2'])
+
+        result = main()
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Rules executed: idle-ec2" in captured.out
+        # Should NOT contain orphan-ebs findings
+        assert "volume/vol-0xyz789" not in captured.out
+        # Should contain idle-ec2 findings
+        assert "i-0abc123def456" in captured.out
+
+    def test_rules_flag_multiple_rules(self, monkeypatch, capsys):
+        """--rules flag with multiple rules filters correctly."""
+        monkeypatch.setattr(sys, 'argv',
+            ['recommend.py', '--dry-run', '--rules', 'idle-ec2,orphan-ebs'])
+
+        result = main()
+
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "idle-ec2" in captured.out
+        assert "orphan-ebs" in captured.out
+        # Should NOT contain oversized-rds findings
+        assert "mydb" not in captured.out
+
+    def test_invalid_rules_raises_error(self, monkeypatch, capsys):
+        """Invalid --rules value raises error with exit code 2."""
+        monkeypatch.setattr(sys, 'argv',
+            ['recommend.py', '--dry-run', '--rules', 'invalid-rule'])
+
+        # argparse exits with SystemExit for invalid args
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+
+        assert excinfo.value.code == 2
+
+    def test_exit_code_0_when_at_least_one_succeeds(self, monkeypatch, capsys):
+        """Exit code 0 when at least one rule succeeds."""
+        monkeypatch.setattr(sys, 'argv', ['recommend.py', '--dry-run'])
+
+        result = main()
+
+        # All fixture rules succeed (error=None)
+        assert result == 0
+
+    def test_exit_code_1_when_all_fail(self, monkeypatch, capsys):
+        """Exit code 1 when all rules fail."""
+        from unittest.mock import patch
+
+        monkeypatch.setattr(sys, 'argv', ['recommend.py', '--rules', 'idle-ec2'])
+
+        # Mock execute_rules to return all failures
+        with patch.object(recommend_module, 'execute_rules') as mock_execute:
+            mock_execute.return_value = [
+                RuleResult("idle-ec2", [], "Error: Access denied")
+            ]
+
+            result = main()
+
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Rule Errors" in captured.out
+
+    def test_report_printed_to_stdout(self, monkeypatch, capsys):
+        """Report is printed to stdout."""
+        monkeypatch.setattr(sys, 'argv', ['recommend.py', '--dry-run'])
+
+        result = main()
+
+        captured = capsys.readouterr()
+        # Check for report structure
+        assert "# FinOps Recommendations Report" in captured.out
+        assert "Generated:" in captured.out
+        assert "Rules executed:" in captured.out
+        assert "## Findings" in captured.out
+        assert "Total estimated monthly savings:" in captured.out
+
+    def test_dry_run_produces_deterministic_output(self, monkeypatch, capsys):
+        """--dry-run produces output without AWS calls using fixture data."""
+        monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+        monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+        monkeypatch.setattr(sys, 'argv', ['recommend.py', '--dry-run'])
+
+        result = main()
+
+        assert result == 0
+        captured = capsys.readouterr()
+
+        # Should have all fixture findings
+        assert "i-0abc123def456" in captured.out  # idle-ec2 fixture
+        assert "mydb" in captured.out  # oversized-rds fixture
+        assert "vol-0xyz789" in captured.out  # orphan-ebs fixture
+        assert "i-untagged" in captured.out  # untagged-spend fixture
+        assert "$291.10" in captured.out  # Total savings
+
+    def test_help_shows_dry_run_and_rules(self, monkeypatch, capsys):
+        """--help shows --dry-run and --rules options."""
+        monkeypatch.setattr(sys, 'argv', ['recommend.py', '--help'])
+
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+
+        assert excinfo.value.code == 0
+        captured = capsys.readouterr()
+        assert "--dry-run" in captured.out
+        assert "--rules" in captured.out
