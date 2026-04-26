@@ -227,3 +227,136 @@ class InvestigationReport:
     events: List[CloudTrailEvent]
     likely_causes: List[LikelyCause]
     investigation_date: datetime
+
+
+# ============================================================================
+# Validator Functions
+# ============================================================================
+
+def validate_date(date_str: str) -> str:
+    r"""
+    Validate date format YYYY-MM-DD strictly.
+
+    Args:
+        date_str: Date string to validate
+
+    Returns:
+        date_str if valid
+
+    Raises:
+        argparse.ArgumentTypeError: If format invalid or date is invalid
+        (e.g., 2024-13-01, 2024-02-30, not a string)
+
+    Implementation:
+    1. Check format with regex: ^\d{4}-\d{2}-\d{2}$
+    2. Parse to datetime to ensure valid calendar date
+    3. Return date_str if both checks pass
+    """
+    # Check regex format
+    if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+        raise argparse.ArgumentTypeError(
+            f"Date '{date_str}' does not match format YYYY-MM-DD"
+        )
+
+    # Parse to validate calendar date
+    try:
+        datetime.strptime(date_str, '%Y-%m-%d')
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            f"Date '{date_str}' is not a valid calendar date: {e}"
+        )
+
+    return date_str
+
+
+def validate_service(service_str: str) -> str:
+    """
+    Validate service name against KNOWN_SERVICES.
+
+    Args:
+        service_str: Service name (e.g., 'EC2', 'RDS')
+
+    Returns:
+        service_str if valid
+
+    Raises:
+        argparse.ArgumentTypeError: If not in KNOWN_SERVICES
+        (e.g., 'UnknownService123', 'ec2' [case-sensitive])
+
+    Implementation:
+    1. Check if service_str in KNOWN_SERVICES
+    2. Raise ArgumentTypeError with list of valid services if not found
+    3. Return service_str if found
+    """
+    if service_str not in KNOWN_SERVICES:
+        sorted_services = sorted(KNOWN_SERVICES)
+        services_list = ', '.join(sorted_services)
+        raise argparse.ArgumentTypeError(
+            f"Service '{service_str}' is not recognized. "
+            f"Valid services are: {services_list}"
+        )
+
+    return service_str
+
+
+def parse_iso_date_to_utc(date_str: str) -> Tuple[datetime, datetime]:
+    """
+    Convert YYYY-MM-DD to UTC start/end times for 24-hour window.
+
+    Args:
+        date_str: Date in YYYY-MM-DD format (assumed valid from validate_date)
+
+    Returns:
+        Tuple of (start_utc, end_utc) datetime objects
+        - start_utc: midnight (00:00:00) on the given date in UTC
+        - end_utc: one second before midnight next day (23:59:59) in UTC
+
+    Example:
+        Input: "2024-03-15"
+        Output: (
+            datetime(2024, 3, 15, 0, 0, 0, tzinfo=timezone.utc),
+            datetime(2024, 3, 15, 23, 59, 59, tzinfo=timezone.utc)
+        )
+    """
+    # Parse the date string
+    date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+
+    # Create timezone-aware datetime objects
+    start_utc = date_obj.replace(hour=0, minute=0, second=0, tzinfo=timezone.utc)
+    end_utc = date_obj.replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+
+    return (start_utc, end_utc)
+
+
+def get_previous_month_range(date_str: str) -> Tuple[datetime, datetime]:
+    """
+    Get start and end dates of the previous calendar month.
+
+    Args:
+        date_str: Date in YYYY-MM-DD format
+
+    Returns:
+        Tuple of (start_date, end_date) as datetime objects (both at midnight UTC)
+        - start_date: first day of previous month (00:00:00 UTC)
+        - end_date: last day of previous month (00:00:00 UTC) [note: midnight of the NEXT day]
+
+    Examples:
+        Input: "2024-03-15" → Output: (datetime(2024, 2, 1), datetime(2024, 3, 1))
+        Input: "2024-01-15" → Output: (datetime(2023, 12, 1), datetime(2024, 1, 1))
+
+    Notes:
+        - Handles year boundary (Jan 1 → Nov 1 of previous year)
+        - Used for calculating baseline cost (previous month average)
+    """
+    # Parse the date string
+    date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+
+    # Get first day of current month
+    current_month_start = date_obj.replace(day=1, hour=0, minute=0, second=0, tzinfo=timezone.utc)
+
+    # Get first day of previous month by subtracting one day from current month start
+    previous_month_end = current_month_start - timedelta(days=1)
+    previous_month_start = previous_month_end.replace(day=1)
+
+    # Return as (start of prev month, start of current month)
+    return (previous_month_start, current_month_start)
