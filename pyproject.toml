@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cost-explorer-query"
+version = "0.1.0"
+description = "Claude Code skill wrapping AWS Cost Explorer API for querying and analyzing AWS costs"
+requires-python = ">=3.9"
+authors = [
+    {name = "AWS Cost Explorer Query Project"}
+]
+
+[project.dependencies]
+boto3 = ">=1.26.0"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
