@@ -7,11 +7,13 @@ Tests cover:
 - CAUSE_DETECTION_THRESHOLDS presence
 - KNOWN_SERVICES correctness
 - Service invariants (no missing keys, excluded services not present)
+- Validator functions (validate_date, validate_service, parse_iso_date_to_utc, get_previous_month_range)
 """
 
 import pytest
 import sys
 import os
+import argparse
 from datetime import datetime, timezone
 from typing import List, Dict
 import importlib.util
@@ -547,3 +549,232 @@ class TestExcludedServices:
         assert 'Batch' not in SERVICE_TO_METRICS
         assert 'Batch' not in SERVICE_TO_RESOURCE_TYPE
         assert 'Batch' not in KNOWN_SERVICES
+
+
+# ============================================================================
+# Tests for Validator Functions
+# ============================================================================
+
+class TestValidateDate:
+    """Test validate_date function."""
+
+    def test_validate_date_valid(self):
+        """Test validate_date accepts valid dates."""
+        # Test various valid dates
+        assert investigate_module.validate_date("2024-03-15") == "2024-03-15"
+        assert investigate_module.validate_date("2024-01-01") == "2024-01-01"
+        assert investigate_module.validate_date("2023-12-31") == "2023-12-31"
+        assert investigate_module.validate_date("2000-02-29") == "2000-02-29"  # Leap year
+
+    def test_validate_date_invalid_format_short(self):
+        """Test validate_date rejects dates with wrong separator spacing."""
+        with pytest.raises(argparse.ArgumentTypeError):
+            investigate_module.validate_date("2024-3-15")  # Single digit month
+
+    def test_validate_date_invalid_format_slash(self):
+        """Test validate_date rejects non-dash separators."""
+        with pytest.raises(argparse.ArgumentTypeError):
+            investigate_module.validate_date("2024/03/15")
+
+    def test_validate_date_invalid_format_no_separator(self):
+        """Test validate_date rejects dates without separators."""
+        with pytest.raises(argparse.ArgumentTypeError):
+            investigate_module.validate_date("20240315")
+
+    def test_validate_date_invalid_month(self):
+        """Test validate_date rejects invalid month numbers."""
+        with pytest.raises(argparse.ArgumentTypeError):
+            investigate_module.validate_date("2024-13-01")
+
+    def test_validate_date_invalid_day(self):
+        """Test validate_date rejects invalid day numbers."""
+        with pytest.raises(argparse.ArgumentTypeError):
+            investigate_module.validate_date("2024-02-30")  # Feb doesn't have 30 days
+
+    def test_validate_date_invalid_leap_year_day(self):
+        """Test validate_date rejects invalid day in non-leap year."""
+        with pytest.raises(argparse.ArgumentTypeError):
+            investigate_module.validate_date("2023-02-29")  # 2023 is not a leap year
+
+    def test_validate_date_invalid_day_31_april(self):
+        """Test validate_date rejects day 31 for April (30-day month)."""
+        with pytest.raises(argparse.ArgumentTypeError):
+            investigate_module.validate_date("2024-04-31")
+
+    def test_validate_date_invalid_zero_month(self):
+        """Test validate_date rejects month zero."""
+        with pytest.raises(argparse.ArgumentTypeError):
+            investigate_module.validate_date("2024-00-15")
+
+    def test_validate_date_invalid_zero_day(self):
+        """Test validate_date rejects day zero."""
+        with pytest.raises(argparse.ArgumentTypeError):
+            investigate_module.validate_date("2024-03-00")
+
+
+class TestValidateService:
+    """Test validate_service function."""
+
+    def test_validate_service_valid(self):
+        """Test validate_service accepts known services."""
+        # Test all known services
+        assert investigate_module.validate_service("EC2") == "EC2"
+        assert investigate_module.validate_service("RDS") == "RDS"
+        assert investigate_module.validate_service("Lambda") == "Lambda"
+        assert investigate_module.validate_service("S3") == "S3"
+        assert investigate_module.validate_service("DynamoDB") == "DynamoDB"
+        assert investigate_module.validate_service("CloudFront") == "CloudFront"
+        assert investigate_module.validate_service("ElasticSearch") == "ElasticSearch"
+        assert investigate_module.validate_service("Kinesis") == "Kinesis"
+        assert investigate_module.validate_service("SNS") == "SNS"
+        assert investigate_module.validate_service("SQS") == "SQS"
+        assert investigate_module.validate_service("ECS") == "ECS"
+        assert investigate_module.validate_service("EKS") == "EKS"
+
+    def test_validate_service_unknown(self):
+        """Test validate_service rejects unknown services."""
+        with pytest.raises(argparse.ArgumentTypeError) as exc_info:
+            investigate_module.validate_service("UnknownService")
+        error_msg = str(exc_info.value)
+        assert "UnknownService" in error_msg
+        assert "not recognized" in error_msg
+
+    def test_validate_service_unknown_with_valid_services_list(self):
+        """Test validate_service error message includes valid services."""
+        with pytest.raises(argparse.ArgumentTypeError) as exc_info:
+            investigate_module.validate_service("InvalidService")
+        error_msg = str(exc_info.value)
+        # Check that some valid services are mentioned in error
+        assert "EC2" in error_msg or "ECS" in error_msg
+
+    def test_validate_service_case_sensitive_lowercase(self):
+        """Test validate_service is case-sensitive (rejects lowercase)."""
+        with pytest.raises(argparse.ArgumentTypeError):
+            investigate_module.validate_service("ec2")
+
+    def test_validate_service_case_sensitive_mixed(self):
+        """Test validate_service is case-sensitive (rejects mixed case)."""
+        with pytest.raises(argparse.ArgumentTypeError):
+            investigate_module.validate_service("Ec2")
+
+    def test_validate_service_excluded_services(self):
+        """Test validate_service rejects excluded services."""
+        with pytest.raises(argparse.ArgumentTypeError):
+            investigate_module.validate_service("AppFlow")
+        with pytest.raises(argparse.ArgumentTypeError):
+            investigate_module.validate_service("Glue")
+        with pytest.raises(argparse.ArgumentTypeError):
+            investigate_module.validate_service("Batch")
+
+
+class TestParseIsoDateToUtc:
+    """Test parse_iso_date_to_utc function."""
+
+    def test_parse_iso_date_to_utc_basic(self):
+        """Test parse_iso_date_to_utc returns correct start and end times."""
+        start, end = investigate_module.parse_iso_date_to_utc("2024-03-15")
+
+        assert start == datetime(2024, 3, 15, 0, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2024, 3, 15, 23, 59, 59, tzinfo=timezone.utc)
+
+    def test_parse_iso_date_to_utc_timezone_aware(self):
+        """Test parse_iso_date_to_utc returns timezone-aware datetimes."""
+        start, end = investigate_module.parse_iso_date_to_utc("2024-03-15")
+
+        # Check that both have UTC timezone
+        assert start.tzinfo is not None
+        assert start.tzinfo == timezone.utc
+        assert end.tzinfo is not None
+        assert end.tzinfo == timezone.utc
+
+    def test_parse_iso_date_to_utc_first_day_of_month(self):
+        """Test parse_iso_date_to_utc with first day of month."""
+        start, end = investigate_module.parse_iso_date_to_utc("2024-01-01")
+
+        assert start == datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2024, 1, 1, 23, 59, 59, tzinfo=timezone.utc)
+
+    def test_parse_iso_date_to_utc_last_day_of_month(self):
+        """Test parse_iso_date_to_utc with last day of month."""
+        start, end = investigate_module.parse_iso_date_to_utc("2024-12-31")
+
+        assert start == datetime(2024, 12, 31, 0, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2024, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+
+    def test_parse_iso_date_to_utc_leap_year(self):
+        """Test parse_iso_date_to_utc with leap year date."""
+        start, end = investigate_module.parse_iso_date_to_utc("2024-02-29")
+
+        assert start == datetime(2024, 2, 29, 0, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2024, 2, 29, 23, 59, 59, tzinfo=timezone.utc)
+
+    def test_parse_iso_date_to_utc_returns_tuple(self):
+        """Test parse_iso_date_to_utc returns a tuple."""
+        result = investigate_module.parse_iso_date_to_utc("2024-03-15")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+
+
+class TestGetPreviousMonthRange:
+    """Test get_previous_month_range function."""
+
+    def test_get_previous_month_range_mid_month(self):
+        """Test get_previous_month_range for mid-month date."""
+        start, end = investigate_module.get_previous_month_range("2024-03-15")
+
+        assert start == datetime(2024, 2, 1, 0, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2024, 3, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    def test_get_previous_month_range_year_boundary(self):
+        """Test get_previous_month_range handles year boundary (Jan -> Dec prev year)."""
+        start, end = investigate_module.get_previous_month_range("2024-01-15")
+
+        assert start == datetime(2023, 12, 1, 0, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    def test_get_previous_month_range_leap_year(self):
+        """Test get_previous_month_range with leap year."""
+        start, end = investigate_module.get_previous_month_range("2024-03-15")
+
+        # Feb 2024 is a leap year with 29 days, so previous month starts Feb 1
+        assert start == datetime(2024, 2, 1, 0, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2024, 3, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    def test_get_previous_month_range_february_non_leap(self):
+        """Test get_previous_month_range with March of non-leap year."""
+        start, end = investigate_module.get_previous_month_range("2023-03-15")
+
+        # Feb 2023 is not a leap year with 28 days, so previous month starts Feb 1
+        assert start == datetime(2023, 2, 1, 0, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2023, 3, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    def test_get_previous_month_range_first_day_of_month(self):
+        """Test get_previous_month_range with first day of month."""
+        start, end = investigate_module.get_previous_month_range("2024-03-01")
+
+        assert start == datetime(2024, 2, 1, 0, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2024, 3, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    def test_get_previous_month_range_last_day_of_month(self):
+        """Test get_previous_month_range with last day of month."""
+        start, end = investigate_module.get_previous_month_range("2024-03-31")
+
+        assert start == datetime(2024, 2, 1, 0, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2024, 3, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    def test_get_previous_month_range_timezone_aware(self):
+        """Test get_previous_month_range returns timezone-aware datetimes."""
+        start, end = investigate_module.get_previous_month_range("2024-03-15")
+
+        assert start.tzinfo is not None
+        assert start.tzinfo == timezone.utc
+        assert end.tzinfo is not None
+        assert end.tzinfo == timezone.utc
+
+    def test_get_previous_month_range_december_to_november(self):
+        """Test get_previous_month_range for December."""
+        start, end = investigate_module.get_previous_month_range("2024-12-15")
+
+        assert start == datetime(2024, 11, 1, 0, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2024, 12, 1, 0, 0, 0, tzinfo=timezone.utc)
