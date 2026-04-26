@@ -1015,3 +1015,84 @@ NetworkOut: 2.5 GB total
 
 ---
 Investigation completed at 2024-03-15T14:30:00Z"""
+
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+def main():
+    """
+    CLI entry point.
+
+    Parses CLI arguments (--date, --service, --dry-run), validates them,
+    routes to either --dry-run fixture mode or real investigation flow,
+    and handles AWS/validation exceptions with proper exit codes (0=success,
+    1=AWS error, 2=validation error).
+
+    Exit Codes:
+    - 0: Success (report generated and printed)
+    - 1: AWS error (credentials, permissions, API failure) or unhandled exception
+    - 2: Argument validation error (invalid date format, unknown service)
+    """
+    parser = argparse.ArgumentParser(
+        description='Investigate AWS cost spikes by correlating cost data with CloudWatch metrics and CloudTrail events.'
+    )
+    parser.add_argument(
+        '--date',
+        required=True,
+        type=validate_date,
+        help='Date to investigate in YYYY-MM-DD format (e.g., 2024-03-15)'
+    )
+    parser.add_argument(
+        '--service',
+        required=True,
+        type=validate_service,
+        help='AWS service name (e.g., EC2, RDS, Lambda, S3, DynamoDB, etc.)'
+    )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Use fixture data instead of querying AWS (for testing without credentials)'
+    )
+
+    try:
+        args = parser.parse_args()
+
+        # Handle --dry-run mode
+        if args.dry_run:
+            # Get fixture report and print it
+            fixture_report = FixtureProvider.get_fixture_report()
+            print(fixture_report)
+            sys.exit(0)
+
+        # Real mode: Initialize investigator and generate report
+        try:
+            investigator = CostAnomalyInvestigator(args.date, args.service)
+            report = investigator.investigate()
+            generator = ReportGenerator()
+            markdown_output = generator.generate(report)
+            print(markdown_output)
+            sys.exit(0)
+
+        except botocore.exceptions.NoCredentialsError as e:
+            print(f"Error: AWS credentials not found: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        except botocore.exceptions.ClientError as e:
+            print(f"Error: AWS API call failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    except argparse.ArgumentTypeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    except Exception as e:
+        # Unhandled exception: print traceback and exit with code 1
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

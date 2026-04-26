@@ -1344,3 +1344,258 @@ class TestCostAnomalyInvestigatorOrchestration:
                 # Spike data should be set
                 assert result.spike.date == '2024-03-15'
                 assert result.spike.service == 'EC2'
+
+
+# ============================================================================
+# Tests for main() Function and CLI
+# ============================================================================
+
+class TestMainEntry:
+    """Test main() function and CLI argument parsing."""
+
+    def test_main_dry_run(self, monkeypatch, capsys):
+        """Test --dry-run mode: print fixture report and exit 0."""
+        from unittest.mock import patch
+
+        # Mock sys.argv with --dry-run
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['investigate.py', '--date', '2024-03-15', '--service', 'EC2', '--dry-run']
+        )
+
+        # Call main() and expect SystemExit(0)
+        with pytest.raises(SystemExit) as exc_info:
+            investigate_module.main()
+
+        # Verify exit code is 0
+        assert exc_info.value.code == 0
+
+        # Capture stdout
+        captured = capsys.readouterr()
+
+        # Verify output is the fixture report
+        assert '# Cost Spike:' in captured.out
+        assert '2024-03-15' in captured.out
+        assert 'EC2' in captured.out
+        assert 'Spike Summary' in captured.out
+
+    def test_main_invalid_date(self, monkeypatch, capsys):
+        """Test invalid date format: exit code 2 with error message."""
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['investigate.py', '--date', '2024-13-01', '--service', 'EC2']
+        )
+
+        # Call main() and expect SystemExit(2)
+        with pytest.raises(SystemExit) as exc_info:
+            investigate_module.main()
+
+        # Verify exit code is 2
+        assert exc_info.value.code == 2
+
+        # Capture stderr
+        captured = capsys.readouterr()
+
+        # Verify error message is printed (from argparse or our handler)
+        assert 'error' in captured.err.lower()
+        assert '2024-13-01' in captured.err
+
+    def test_main_invalid_service(self, monkeypatch, capsys):
+        """Test unknown service name: exit code 2 with error message listing valid services."""
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['investigate.py', '--date', '2024-03-15', '--service', 'UnknownService123']
+        )
+
+        # Call main() and expect SystemExit(2)
+        with pytest.raises(SystemExit) as exc_info:
+            investigate_module.main()
+
+        # Verify exit code is 2
+        assert exc_info.value.code == 2
+
+        # Capture stderr
+        captured = capsys.readouterr()
+
+        # Verify error message is printed with service name and valid services
+        assert 'error' in captured.err.lower()
+        assert 'UnknownService123' in captured.err
+        # Should mention some valid services
+        assert 'EC2' in captured.err or 'CloudFront' in captured.err
+
+    def test_main_missing_date(self, monkeypatch, capsys):
+        """Test missing --date flag: exit code 2."""
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['investigate.py', '--service', 'EC2']
+        )
+
+        # Call main() and expect SystemExit(2)
+        with pytest.raises(SystemExit) as exc_info:
+            investigate_module.main()
+
+        # Verify exit code is 2 (argument parsing failure)
+        assert exc_info.value.code == 2
+
+    def test_main_missing_service(self, monkeypatch, capsys):
+        """Test missing --service flag: exit code 2."""
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['investigate.py', '--date', '2024-03-15']
+        )
+
+        # Call main() and expect SystemExit(2)
+        with pytest.raises(SystemExit) as exc_info:
+            investigate_module.main()
+
+        # Verify exit code is 2 (argument parsing failure)
+        assert exc_info.value.code == 2
+
+    def test_main_success(self, monkeypatch, capsys):
+        """Test successful main() execution: exit code 0 with markdown output."""
+        from unittest.mock import Mock, patch
+
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['investigate.py', '--date', '2024-03-15', '--service', 'EC2']
+        )
+
+        # Create a mock module with CostExplorerClient
+        mock_ce = Mock()
+        mock_ce.get_costs.side_effect = [
+            [('EC2', 29000.0)],  # Previous month (Feb 2024, 29 days, so ~1000/day)
+            [('EC2', 5000.0)]     # Spike date
+        ]
+
+        mock_module = Mock()
+        mock_module.CostExplorerClient = Mock(return_value=mock_ce)
+
+        # Mock the entire investigator to avoid real AWS calls
+        mock_spike = investigate_module.SpikeSummary(
+            date='2024-03-15',
+            service='EC2',
+            baseline_cost=1000.0,
+            spike_cost=5000.0,
+            delta=4000.0,
+            delta_percent=400.0
+        )
+
+        mock_report = investigate_module.InvestigationReport(
+            spike=mock_spike,
+            metrics={},
+            events=[],
+            likely_causes=[
+                investigate_module.LikelyCause(1, "Test cause", "Test description", 0)
+            ],
+            investigation_date=datetime(2024, 3, 15, 12, 0, 0, tzinfo=timezone.utc)
+        )
+
+        # Patch CostAnomalyInvestigator.investigate to return mock report
+        with patch.object(investigate_module.CostAnomalyInvestigator, 'investigate', return_value=mock_report):
+            with patch('importlib.import_module', return_value=mock_module):
+                # Call main() and expect SystemExit(0)
+                with pytest.raises(SystemExit) as exc_info:
+                    investigate_module.main()
+
+                # Verify exit code is 0
+                assert exc_info.value.code == 0
+
+                # Capture stdout
+                captured = capsys.readouterr()
+
+                # Verify output is markdown report
+                assert '# Cost Spike:' in captured.out
+                assert '2024-03-15' in captured.out
+                assert 'EC2' in captured.out
+
+    def test_main_aws_credentials_error(self, monkeypatch, capsys):
+        """Test AWS credentials missing: exit code 1 with error message."""
+        from unittest.mock import Mock, patch
+        import botocore.exceptions
+
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['investigate.py', '--date', '2024-03-15', '--service', 'EC2']
+        )
+
+        # Mock CostAnomalyInvestigator.investigate() to raise NoCredentialsError
+        mock_ce = Mock()
+        mock_ce.get_costs.side_effect = botocore.exceptions.NoCredentialsError()
+
+        mock_module = Mock()
+        mock_module.CostExplorerClient = Mock(return_value=mock_ce)
+
+        with patch('importlib.import_module', return_value=mock_module):
+            # Call main() and expect SystemExit(1)
+            with pytest.raises(SystemExit) as exc_info:
+                investigate_module.main()
+
+            # Verify exit code is 1
+            assert exc_info.value.code == 1
+
+            # Capture stderr
+            captured = capsys.readouterr()
+
+            # Verify error message is printed
+            assert 'Error:' in captured.err
+            assert 'credentials' in captured.err.lower()
+
+    def test_main_aws_client_error(self, monkeypatch, capsys):
+        """Test AWS API error: exit code 1 with error message."""
+        from unittest.mock import Mock, patch
+        import botocore.exceptions
+
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['investigate.py', '--date', '2024-03-15', '--service', 'EC2']
+        )
+
+        # Create a mock ClientError
+        error_response = {'Error': {'Code': 'AccessDenied', 'Message': 'User not authorized'}}
+        operation_name = 'GetCostAndUsage'
+
+        # Mock CostExplorerClient.investigate() to raise ClientError
+        mock_ce = Mock()
+        mock_ce.get_costs.side_effect = botocore.exceptions.ClientError(error_response, operation_name)
+
+        mock_module = Mock()
+        mock_module.CostExplorerClient = Mock(return_value=mock_ce)
+
+        with patch('importlib.import_module', return_value=mock_module):
+            # Call main() and expect SystemExit(1)
+            with pytest.raises(SystemExit) as exc_info:
+                investigate_module.main()
+
+            # Verify exit code is 1
+            assert exc_info.value.code == 1
+
+            # Capture stderr
+            captured = capsys.readouterr()
+
+            # Verify error message is printed
+            assert 'Error:' in captured.err
+            assert 'API call failed' in captured.err or 'AWS' in captured.err
+
+    def test_main_unhandled_exception(self, monkeypatch, capsys):
+        """Test unhandled exception: exit code 1 with traceback."""
+        from unittest.mock import patch
+
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['investigate.py', '--date', '2024-03-15', '--service', 'EC2']
+        )
+
+        # Mock CostAnomalyInvestigator.investigate to raise an unexpected exception
+        with patch.object(investigate_module.CostAnomalyInvestigator, 'investigate', side_effect=RuntimeError('Unexpected error')):
+            # Call main() and expect SystemExit(1)
+            with pytest.raises(SystemExit) as exc_info:
+                investigate_module.main()
+
+            # Verify exit code is 1
+            assert exc_info.value.code == 1
+
+            # Capture stderr
+            captured = capsys.readouterr()
+
+            # Verify traceback is printed
+            assert 'Traceback' in captured.err or 'RuntimeError' in captured.err
